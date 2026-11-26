@@ -1,0 +1,28 @@
+# Rust build outputs
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local secrets & runtime state (NEVER commit keys or deployment models)
+.env
+*.env
+!*.env.example
+*.key
+*.pem
+*secret*
+!docs/THREAT_MODEL.md
+*.state
+*.model
+*.previous.model
+*.tmp
+*.sock
+*.log
+
+# Python / OS / Editor artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

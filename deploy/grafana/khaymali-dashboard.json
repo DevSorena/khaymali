@@ -1,0 +1,142 @@
+{
+  "title": "Khaymali Tunnel v0.15.0 \u2014 Adaptive Network Intelligence",
+  "uid": "khaymali-v015-intel",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Active Streams & Ready Pool",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "khaymali_streams_active",
+          "legendFormat": "streams_active"
+        },
+        {
+          "expr": "khaymali_links_ready",
+          "legendFormat": "links_ready"
+        },
+        {
+          "expr": "khaymali_adapt_pool_target",
+          "legendFormat": "pool_target"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Throughput (Bytes Up/Down) & Windowed Goodput (kbps)",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(khaymali_bytes_up_total[30s]) * 8 / 1000",
+          "legendFormat": "up_kbps"
+        },
+        {
+          "expr": "rate(khaymali_bytes_down_total[30s]) * 8 / 1000",
+          "legendFormat": "down_kbps"
+        },
+        {
+          "expr": "khaymali_intelligence_measured_goodput_kbps",
+          "legendFormat": "measured_goodput_kbps"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Predictive Severity & Calibrated Risk",
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "khaymali_intelligence_predicted_severity",
+          "legendFormat": "severity_now"
+        },
+        {
+          "expr": "khaymali_intelligence_projected_severity",
+          "legendFormat": "projected_severity"
+        },
+        {
+          "expr": "khaymali_intelligence_degradation_probability_milli / 10",
+          "legendFormat": "risk_prob_pct"
+        },
+        {
+          "expr": "khaymali_intelligence_path_score_tenths / 10",
+          "legendFormat": "path_score"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "TinyNetNlp v4.2 Actions, Recommendations & Abstentions",
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "rate(khaymali_nlp_actions_total[1m])",
+          "legendFormat": "nlp_actions/s"
+        },
+        {
+          "expr": "rate(khaymali_nlp_recommendations_total[1m])",
+          "legendFormat": "nlp_recommendations/s"
+        },
+        {
+          "expr": "rate(khaymali_nlp_abstentions_total[1m])",
+          "legendFormat": "nlp_abstentions/s"
+        },
+        {
+          "expr": "khaymali_adaptive_chunk_bytes",
+          "legendFormat": "chunk_bytes"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Exit RTT, Jitter & UDP Loss",
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 24,
+        "h": 8
+      },
+      "targets": [
+        {
+          "expr": "khaymali_exit_rtt_ms",
+          "legendFormat": "rtt_ms {{addr}}"
+        },
+        {
+          "expr": "khaymali_exit_jitter_ms",
+          "legendFormat": "jitter_ms {{addr}}"
+        },
+        {
+          "expr": "khaymali_udp_loss_per_mille / 10",
+          "legendFormat": "udp_loss_pct"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+name: Bug Report
+description: Report a bug or harsh-network failure in Khaymali Tunnel
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security Reminder:** Never paste private keys (`KHAYMALI_KEY`), camouflage secrets (`KHAYMALI_CAMO_SECRET`), or real public server IPs. For security vulnerabilities, use the private **Security** tab instead of a public issue.
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Secret Redaction Confirmation
+      options:
+        - label: I have removed all private keys, camo secrets, and sensitive server IPs from the logs below.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Khaymali Version & OS
+      placeholder: "khaymali 0.15.0 / Ubuntu 24.04 / kernel 6.8"
+    validations:
+      required: true
+  - type: dropdown
+    id: role
+    attributes:
+      label: Affected Role
+      options:
+        - Entry
+        - Bridge
+        - Exit
+        - CLI / Intelligence / NLP
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the issue, network condition, and steps to reproduce.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Output of `khaymali doctor` and redacted logs
+      render: shell

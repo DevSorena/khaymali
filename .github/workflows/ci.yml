@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-test:
+    name: Rust build, unit, security & loopback CLI tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.75.0
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Ensure Cargo.lock exists for reproducible builds
+        run: |
+          if [ ! -f Cargo.lock ]; then
+            cargo generate-lockfile
+          fi
+
+      - name: Unit tests (lib)
+        run: cargo test --locked --lib
+
+      - name: v0.15.1 regression tests (NLP guard, revert, artifacts, model fixes)
+        run: cargo test --locked --lib v0151_ -- --nocapture
+
+      - name: Negative security tests
+        run: cargo test --locked --test neg_security
+
+      - name: Release build
+        run: cargo build --locked --release
+
+      - name: Intelligence, Doctor & NLP CLI smoke tests
+        run: bash tests/intelligence_cli.sh target/release/khaymali
+
+      - name: Loopback integration suite
+        run: |
+          set +e
+          bash tests/integration.sh target/release/khaymali 2>&1 | tee /tmp/khaymali-integration.log
+          set -e
+          BAD=$(grep -E "^  FAIL:" /tmp/khaymali-integration.log | grep -vc "plain-HTTP probe" || true)
+          test "$BAD" = "0"
+
+      - name: Adaptive engine chaos test
+        run: bash tests/chaos.sh target/release/khaymali
+
+  scripts-lint:
+    name: Shell & Python syntax checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax check
+        run: |
+          for f in install.sh scripts/*.sh tests/*.sh; do
+            bash -n "$f"
+          done
+      - name: Python syntax check
+        run: python3 -m py_compile scripts/*.py tests/*.py
+      - name: Validate Grafana JSON
+        run: python3 -c "import json; json.load(open('deploy/grafana/khaymali-dashboard.json'))"

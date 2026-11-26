@@ -1,0 +1,69 @@
+name: Stress 200-300 (loopback A/B)
+
+# Runs the full harsh-network stress matrix on a GitHub runner:
+# 10 hostile profiles x 200/250/300 concurrent SOCKS5 clients x 3 repetitions,
+# NLP shadow vs active, then the A/B gate and the replay audit. Loopback only.
+on:
+  workflow_dispatch:
+    inputs:
+      steps:
+        description: "Client steps"
+        default: "200 250 300"
+      repeats:
+        description: "Repetitions per profile/step"
+        default: "3"
+  schedule:
+    - cron: "0 3 * * 1"   # weekly, Monday 03:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.75.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: |
+          [ -f Cargo.lock ] || cargo generate-lockfile
+          cargo build --locked --release
+      - name: Raise limits
+        run: |
+          ulimit -n 65535 || true
+          sudo sysctl -w net.core.somaxconn=4096 net.ipv4.tcp_max_syn_backlog=8192 net.ipv4.ip_local_port_range="10240 65000" || true
+      - name: Shadow run
+        continue-on-error: true
+        env:
+          KHAYMALI_STEPS: ${{ inputs.steps || '200 250 300' }}
+          REPEATS: ${{ inputs.repeats || '3' }}
+        run: OUT=/tmp/khaymali-shadow POOL=48 KHAYMALI_NLP_MODE=shadow bash tests/stress_harsh.sh target/release/khaymali
+      - name: Active run
+        continue-on-error: true
+        env:
+          KHAYMALI_STEPS: ${{ inputs.steps || '200 250 300' }}
+          REPEATS: ${{ inputs.repeats || '3' }}
+        run: OUT=/tmp/khaymali-active POOL=48 KHAYMALI_NLP_MODE=active bash tests/stress_harsh.sh target/release/khaymali
+      - name: A/B gate
+        run: |
+          python3 scripts/ab_compare.py /tmp/khaymali-shadow /tmp/khaymali-active --json /tmp/ab.json | tee /tmp/ab.txt
+          echo '```' >> "$GITHUB_STEP_SUMMARY"; cat /tmp/ab.txt >> "$GITHUB_STEP_SUMMARY"; echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - name: Replay audit + annotation sample
+        if: always()
+        run: |
+          python3 scripts/eval_nlp_replay.py target/release/khaymali /tmp/khaymali-active/replay_dataset.jsonl | tee /tmp/replay.txt || true
+          python3 scripts/make_annotation_set.py /tmp/khaymali-active/replay_dataset.jsonl /tmp/annotate.tsv || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stress-results
+          path: |
+            /tmp/khaymali-shadow/*.json
+            /tmp/khaymali-active/*.json
+            /tmp/khaymali-active/replay_dataset.jsonl
+            /tmp/ab.json
+            /tmp/ab.txt
+            /tmp/replay.txt
+            /tmp/annotate.tsv

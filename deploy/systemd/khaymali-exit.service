@@ -1,0 +1,22 @@
+[Unit]
+Description=Khaymali Tunnel Exit Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/khaymali/exit.env
+ExecStart=/usr/local/bin/khaymali exit   --listen ${KHAYMALI_LISTEN:-0.0.0.0:4440}   --allow ${KHAYMALI_ALLOW_ENTRY_PUB}   --metrics ${KHAYMALI_METRICS:-127.0.0.1:9110}   --control /run/khaymali/exit.sock
+RuntimeDirectory=khaymali
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/khaymali
+
+[Install]
+WantedBy=multi-user.target

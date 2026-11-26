@@ -1,0 +1,31 @@
+Khaymali v0.14.0 — Adaptive Network Intelligence Completion
+
+Source changes included:
+- calibrated degradation-risk prediction with holdout metrics and persisted calibrator
+- deterministic bounded queue/packet digital twin and CLI
+- per-path Bridge telemetry, bounded LRU, and evidence-aware path ranking
+- measured event-based goodput and RTT-variation jitter (unavailable counters are not fabricated)
+- candidate-isolated TinyNetNlp learning, holdout promotion gate, artifact persistence, reload and rollback
+- offline experiment scheduling, paired comparisons, and hard count/estimated-memory budgets
+- expanded numeric decision explanations and Prometheus metrics
+- additional unit and CLI smoke tests
+
+Validation performed in preparation environment:
+- Cargo.toml parsed and package version checked
+- Python syntax checks passed
+- shell syntax checks passed
+- Rust lexical delimiter scan passed (not a Rust compiler)
+- ZIP integrity checked after packaging
+
+Not run / not claimed:
+- rustc compilation
+- cargo test / integration tests
+- release build
+- loopback 200/250/300-client stress
+- real-host network/transport measurements
+
+The preparation environment does not contain rustc or cargo. Run:
+  bash scripts/verify_build_and_tests.sh
+For the full harsh loopback 200/250/300 matrix:
+  RUN_HARSH=1 bash scripts/verify_build_and_tests.sh
+The script generates Cargo.lock if missing, then runs Cargo with --locked.

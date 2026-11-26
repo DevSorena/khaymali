@@ -1,0 +1,24 @@
+Khaymali v0.15.1 — public source release candidate
+
+Changes on top of v0.15.0: see CHANGELOG.md [0.15.1].
+
+Static checks performed in the preparation environment:
+- Delimiter balance of every changed .rs file (identical to v0.15.0 baseline): PASS
+- format!() placeholder/argument count of recovery.status: PASS (28/28)
+- Rust 1.75 API scan of new code (is_some_and, OnceLock, total_cmp, then_some): PASS
+- Python syntax for all changed scripts: PASS; ab_compare.py and make_annotation_set.py run on synthetic data: PASS
+- Model changes measured on an exact Python twin of TinyNetNlp: see CHANGELOG
+- ZIP integrity + SHA-256 (see SHA256SUMS)
+
+NOT run / NOT claimed:
+- rustc / cargo test / cargo build --release
+- loopback 200/250/300-client stress, A/B, chaos, integration
+- any real-network measurement
+
+Before tagging a public release, on a Linux host with Rust 1.75+:
+  1. Replace OWNER/khaymali with your GitHub repo in install.sh, README.md and .github/ISSUE_TEMPLATE/config.yml
+  2. cargo generate-lockfile && git add Cargo.lock
+  3. bash scripts/verify_build_and_tests.sh                 (unit + v0151_ + security + integration + chaos + stress 300)
+  4. RUN_HARSH=1 RUN_AB=1 REPEATS=3 bash scripts/verify_build_and_tests.sh
+  5. Keep KHAYMALI_NLP_MODE=shadow unless ab_compare.py reports clean as not worse
+  6. git tag v0.15.1-rc.1 && git push --tags   (release.yml builds static amd64/arm64 + provenance)

@@ -1,0 +1,24 @@
+[Unit]
+Description=Khaymali Tunnel Bridge Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/khaymali/bridge.env
+ExecStart=/usr/local/bin/khaymali bridge   --entry ${KHAYMALI_ENTRY}   --entry-pub ${KHAYMALI_ENTRY_PUB}   --exit ${KHAYMALI_EXIT}   --pool ${KHAYMALI_POOL:-16}   --metrics ${KHAYMALI_METRICS:-127.0.0.1:9111}   --control /run/khaymali/bridge.sock
+RuntimeDirectory=khaymali
+RuntimeDirectoryMode=0750
+StateDirectory=khaymali
+StateDirectoryMode=0750
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/khaymali /run/khaymali
+
+[Install]
+WantedBy=multi-user.target
