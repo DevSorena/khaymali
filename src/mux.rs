@@ -507,7 +507,8 @@ impl MuxCarrier {
                                                     ack: new_ack,
                                                 };
                                                 let _ = tx_ack
-                                                    .try_send(encode_frame(CMD_RESUME, 0, &ack_f.encode()));
+                                                    .send(encode_frame(CMD_RESUME, 0, &ack_f.encode()))
+                                                    .await;
                                             }
                                         });
                                     }
@@ -518,7 +519,7 @@ impl MuxCarrier {
                                     if let Some(ow) =
                                         c_rd.state.lock().unwrap().resumable_owners.get(&session_id)
                                     {
-                                        ow.dataplane.lock().unwrap().process_ack(ack);
+                                        ow.apply_ack(ack);
                                     }
                                 }
                                 ResumeFrame::SeqFin { session_id, .. } => {
@@ -1028,7 +1029,8 @@ pub async fn serve_exit_with_registry(
                                             ack: new_ack,
                                         };
                                         let _ = tx_ack
-                                            .try_send(encode_frame(CMD_RESUME, 0, &ack_f.encode()));
+                                            .send(encode_frame(CMD_RESUME, 0, &ack_f.encode()))
+                                                    .await;
                                     }
                                 });
                             }
@@ -1037,7 +1039,7 @@ pub async fn serve_exit_with_registry(
                             session_id, ack, ..
                         } => {
                             if let Some(ow) = session_reg.get(&session_id) {
-                                ow.dataplane.lock().unwrap().process_ack(ack);
+                                ow.apply_ack(ack);
                             }
                         }
                         ResumeFrame::SeqFin { session_id, .. } => {

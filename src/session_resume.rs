@@ -405,6 +405,8 @@ pub struct SessionOwner {
     pub dataplane: Mutex<ResumeDataPlane>,
     carrier_tx: Mutex<Option<mpsc::Sender<ResumeFrame>>>,
     reattached_notify: Notify,
+    /// Woken when an ACK frees space in the un-ACKed send window.
+    pub window_notify: Notify,
     to_socket_tx: mpsc::Sender<Vec<u8>>,
 }
 
@@ -441,6 +443,7 @@ impl SessionOwner {
             dataplane: Mutex::new(ResumeDataPlane::new(MAX_UNACKED_BYTES_PER_SESSION)),
             carrier_tx: Mutex::new(None),
             reattached_notify: Notify::new(),
+            window_notify: Notify::new(),
             to_socket_tx,
         })
     }
@@ -499,11 +502,30 @@ impl SessionOwner {
         if self.closed.load(Relaxed) {
             bail!("session closed");
         }
-        let seq = {
-            let mut dp = self.dataplane.lock().unwrap();
-            dp.stage_outbound(payload.clone())?
-        };
         let deadline = Instant::now() + wait_budget;
+        // Flow control: wait (bounded by `wait_budget`) for the peer to ACK enough data instead of
+        // failing as soon as the 512 KiB un-ACKed window is full.
+        let seq = loop {
+            if self.closed.load(Relaxed) {
+                bail!("session closed");
+            }
+            let staged = {
+                let mut dp = self.dataplane.lock().unwrap();
+                if dp.unacked_bytes() + payload.len() <= MAX_UNACKED_BYTES_PER_SESSION {
+                    Some(dp.stage_outbound(payload.clone())?)
+                } else {
+                    None
+                }
+            };
+            if let Some(seq) = staged {
+                break seq;
+            }
+            let rem = deadline.saturating_duration_since(Instant::now());
+            if rem.is_zero() {
+                bail!("send window stayed full: peer stopped acknowledging");
+            }
+            let _ = tokio::time::timeout(rem.min(Duration::from_millis(50)), self.window_notify.notified()).await;
+        };
         loop {
             if self.closed.load(Relaxed) {
                 bail!("session closed while waiting for carrier");
@@ -540,6 +562,12 @@ impl SessionOwner {
         }
     }
 
+    /// Apply a cumulative ACK from the peer and wake senders waiting for window space.
+    pub fn apply_ack(&self, ack: u64) {
+        self.dataplane.lock().unwrap().process_ack(ack);
+        self.window_notify.notify_waiters();
+    }
+
     pub async fn deliver_from_carrier(
         &self,
         epoch: u32,
@@ -555,6 +583,7 @@ impl SessionOwner {
             dp.process_ack(ack);
             dp.ingest_inbound(seq, payload)?
         };
+        self.window_notify.notify_waiters();
         *self.last_activity.lock().unwrap() = Instant::now();
         for c in chunks {
             if self.to_socket_tx.send(c).await.is_err() {
@@ -569,6 +598,7 @@ impl SessionOwner {
         self.closed.store(true, Relaxed);
         self.detach_carrier();
         self.reattached_notify.notify_waiters();
+        self.window_notify.notify_waiters();
     }
 }
 
