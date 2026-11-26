@@ -322,7 +322,10 @@ impl PmtuTracker {
         let target = if next_hop_mtu >= self.floor_mtu {
             next_hop_mtu.min(cur.saturating_sub(20)).max(self.floor_mtu)
         } else {
-            cur.saturating_sub(60).max(self.floor_mtu)
+            // A reported next-hop MTU below the protocol floor is bogus or hostile (RFC 8201:
+            // never go below 1280). Clamp straight to the floor instead of stepping down
+            // 60 bytes per message, which left oversized packets blackholed for several rounds.
+            self.floor_mtu
         };
         self.current_mtu.store(target, Relaxed);
         target
