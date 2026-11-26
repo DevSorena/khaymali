@@ -1,0 +1,886 @@
+#!/usr/bin/env python3
+"""Khaymali Tunnel Interactive TUI Dashboard (zero external dependencies, Python 3 curses).
+
+Usage:
+  khaymali-tui                                 # Auto-detect live control socket + metrics
+  khaymali-tui --metrics http://127.0.0.1:9100/metrics
+  khaymali-tui --control /run/khaymali/entry.sock
+  khaymali-tui --demo                          # Interactive preview with animated live traffic
+"""
+import argparse
+import collections
+import curses
+import datetime
+import json
+import math
+import os
+import random
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+
+DEFAULT_SOCKS = [
+    os.environ.get("KHAYMALI_CONTROL", ""),
+    "/run/khaymali/entry.sock",
+    "/run/khaymali/exit.sock",
+    "/run/khaymali/bridge.sock",
+]
+DEFAULT_METRICS = [
+    os.environ.get("KHAYMALI_METRICS_URL", ""),
+    "http://127.0.0.1:9100/metrics",
+    "http://127.0.0.1:9109/metrics",
+    "http://127.0.0.1:9090/metrics",
+    "http://127.0.0.1:9110/metrics",
+]
+
+COND_NAMES = ["Normal", "Degraded", "Hostile", "Blackout", "Recovering"]
+MODE_NAMES = ["Normal", "Watch", "Degraded", "Critical"]
+NLP_INTENTS = [
+    "healthy", "early_rst", "byte_freeze", "pmtu_drop",
+    "throttle", "route_or_dns_fail", "unrelated",
+]
+
+SIDEBAR_ITEMS = [
+    ("setup_iran", "Setup Iran"),
+    ("setup_kharej", "Setup Kharej"),
+    ("manage", "Manage"),
+    ("web_panel", "Web Panel"),
+    ("update", "Update"),
+    ("optimize", "Optimize"),
+    ("uninstall", "Uninstall"),
+    ("exit", "Exit"),
+]
+
+TABS = ["NODES", "CONNECTION TEST", "TUNNELS", "FORWARDED PORTS"]
+
+
+def fmt_bytes(b: float) -> str:
+    b = max(0.0, float(b))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024.0 or unit == "TB":
+            return f"{b:.1f} {unit}" if unit != "B" else f"{int(b)} B"
+        b /= 1024.0
+    return f"{b:.1f} TB"
+
+
+def fmt_rate(bps: float) -> str:
+    bps = max(0.0, float(bps))
+    if bps >= 1e9:
+        return f"{bps / 1e9:.2f} Gb/s"
+    if bps >= 1e6:
+        return f"{bps / 1e6:.1f} Mb/s"
+    if bps >= 1e3:
+        return f"{bps / 1e3:.1f} kb/s"
+    return f"{int(bps)} b/s"
+
+
+def fmt_uptime(secs: float) -> str:
+    s = max(0, int(secs))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, sec = divmod(s, 60)
+    if d > 0:
+        return f"{d}d {h}h"
+    if h > 0:
+        return f"{h}h {m}m"
+    if m > 0:
+        return f"{m}m {sec}s"
+    return f"{sec}s"
+
+
+def parse_prometheus(text: str):
+    scalars, exits = {}, {}
+    for line in text.splitlines():
+        m = re.match(r'^khaymali_exit_([a-z0-9_]+)\{addr="([^"]+)"\}\s+([0-9.\-]+)$', line)
+        if m:
+            exits.setdefault(m.group(2), {})[m.group(1)] = float(m.group(3))
+            continue
+        m = re.match(r'^khaymali_([a-z0-9_]+)\s+([0-9.\-]+)$', line)
+        if m:
+            scalars[m.group(1)] = float(m.group(2))
+    return scalars, exits
+
+
+def control_rpc(sock_path: str, payload: dict, timeout: float = 0.8):
+    if not sock_path or not os.path.exists(sock_path):
+        return None
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(sock_path)
+        s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        chunks = []
+        while True:
+            buf = s.recv(65536)
+            if not buf:
+                break
+            chunks.append(buf)
+            if b"\n" in buf:
+                break
+        raw = b"".join(chunks).decode("utf-8", "replace").strip()
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def fetch_metrics(urls):
+    for url in urls:
+        if not url:
+            continue
+        try:
+            with urllib.request.urlopen(url, timeout=0.6) as resp:
+                return url, parse_prometheus(resp.read().decode("utf-8", "replace"))
+        except Exception:
+            continue
+    return None, ({}, {})
+
+
+class DataStore:
+    def __init__(self, demo: bool = False, control_sock: str = "", metrics_url: str = ""):
+        self.demo = demo
+        self.control_sock = control_sock
+        self.metrics_url = metrics_url
+        self.hostname = socket.gethostname()
+        self.tunnels = []
+        self.forwards = []
+        self.status = {}
+        self.recovery = {}
+        self.adapt = {}
+        self.scalars = {}
+        self.active_sock = None
+        self.active_metrics = None
+        self.prev_ts = None
+        self.prev_up = 0.0
+        self.prev_dn = 0.0
+        self.tx_bps = 0.0
+        self.rx_bps = 0.0
+        self.peak_rx_bps = 0.0
+        self.hist_tx = collections.deque([0.0] * 48, maxlen=48)
+        self.hist_rx = collections.deque([0.0] * 48, maxlen=48)
+        self.conn_test_log = []
+        self._demo_rng = random.Random(42)
+        self._demo_tick = 0
+        if self.demo:
+            self._init_demo()
+
+    def _init_demo(self):
+        for i in range(48):
+            wave = 0.55 + 0.35 * math.sin(i * 0.22) + self._demo_rng.uniform(-0.08, 0.08)
+            rx = max(8e6, min(102e6, wave * 90e6))
+            tx = max(3e6, rx * self._demo_rng.uniform(0.25, 0.42))
+            self.hist_tx.append(tx)
+            self.hist_rx.append(rx)
+        self.peak_rx_bps = 102.2e6
+
+    def poll(self):
+        if self.demo:
+            self._poll_demo()
+            return
+        now = time.monotonic()
+
+        sock_candidates = [self.control_sock] if self.control_sock else DEFAULT_SOCKS
+        sock = next((p for p in sock_candidates if p and os.path.exists(p)), None)
+        self.active_sock = sock
+
+        if sock:
+            st = control_rpc(sock, {"method": "status"})
+            if st and st.get("ok"):
+                self.status = st
+            rec = control_rpc(sock, {"method": "recovery.status"})
+            if rec and rec.get("ok"):
+                self.recovery = rec
+            ad = control_rpc(sock, {"method": "adapt.status"})
+            if ad and ad.get("ok"):
+                self.adapt = ad
+            fw = control_rpc(sock, {"method": "forwards.list"})
+            if fw and fw.get("ok"):
+                self.forwards = fw.get("forwards", [])
+            peers = control_rpc(sock, {"method": "peers.list"})
+            peer_code = ""
+            if peers and peers.get("peers"):
+                peer_code = peers["peers"][0].get("check_code", "")
+        else:
+            peer_code = ""
+
+        m_candidates = [self.metrics_url] if self.metrics_url else DEFAULT_METRICS
+        m_url, (sc, ex_map) = fetch_metrics(m_candidates)
+        self.active_metrics = m_url
+        self.scalars = sc
+
+        up_b = self.status.get("bytes_up", sc.get("bytes_up_total", 0.0))
+        dn_b = self.status.get("bytes_down", sc.get("bytes_down_total", 0.0))
+        if self.prev_ts is not None and now > self.prev_ts:
+            dt = now - self.prev_ts
+            self.tx_bps = max(0.0, (up_b - self.prev_up) * 8.0 / dt)
+            self.rx_bps = max(0.0, (dn_b - self.prev_dn) * 8.0 / dt)
+            self.peak_rx_bps = max(self.peak_rx_bps, self.rx_bps)
+            self.hist_tx.append(self.tx_bps)
+            self.hist_rx.append(self.rx_bps)
+        self.prev_ts = now
+        self.prev_up = up_b
+        self.prev_dn = dn_b
+
+        role = str(self.status.get("role", "entry")).upper()
+        if role == "ENTRY":
+            role_tag = "IRAN"
+        elif role == "EXIT":
+            role_tag = "EXIT"
+        else:
+            role_tag = role[:6]
+        transport = str(self.status.get("transport", "tcp+mux"))
+        uptime = self.status.get("uptime_secs", 0)
+        carriers = int(self.status.get("mux_carriers", sc.get("mux_carriers_active", sc.get("links_ready", 0))))
+        streams = int(self.status.get("streams_active", sc.get("streams_active", 0)))
+        loss = float(self.recovery.get("loss_pct", sc.get("udp_loss_per_mille", 0.0) / 10.0))
+        fw_summary = " ".join(
+            f"{f.get('port')}/{f.get('proto')}" if f.get("proto") == "udp" else str(f.get("port"))
+            for f in self.forwards[:4]
+        ) or "1080/socks5"
+
+        tunnels = []
+        if ex_map:
+            n_up = max(1, sum(1 for v in ex_map.values() if v.get("up", 0) >= 1))
+            for addr, info in sorted(ex_map.items()):
+                is_up = info.get("up", 0) >= 1
+                host_part, _, port_part = addr.rpartition(":")
+                tunnels.append({
+                    "name": host_part or addr,
+                    "addr": addr,
+                    "port": port_part or "443",
+                    "role": role_tag,
+                    "transport": transport,
+                    "up": is_up,
+                    "state": f"up {fmt_uptime(uptime)}" if (is_up and uptime) else ("up" if is_up else "down"),
+                    "carriers": carriers if is_up else 0,
+                    "streams": streams if is_up else 0,
+                    "rtt_ms": float(info.get("rtt_ms", 0.0)),
+                    "jitter_ms": float(info.get("jitter_ms", 0.0)),
+                    "loss_pct": loss,
+                    "tx_bps": self.tx_bps / n_up if is_up else 0.0,
+                    "rx_bps": self.rx_bps / n_up if is_up else 0.0,
+                    "bytes_up": up_b,
+                    "bytes_down": dn_b,
+                    "uptime_secs": uptime,
+                    "check_code": peer_code or "LIVE-NODE",
+                    "forwards": fw_summary,
+                })
+        elif sc or self.status:
+            tunnels.append({
+                "name": "khaymali-local",
+                "addr": self.active_metrics or self.active_sock or "127.0.0.1",
+                "port": "443",
+                "role": role_tag,
+                "transport": transport,
+                "up": True,
+                "state": f"up {fmt_uptime(uptime)}" if uptime else "up",
+                "carriers": carriers,
+                "streams": streams,
+                "rtt_ms": float(sc.get("nlp_link_rtt_ms", 0.0)),
+                "jitter_ms": float(sc.get("intelligence_measured_jitter_tenths_ms", 0.0)) / 10.0,
+                "loss_pct": loss,
+                "tx_bps": self.tx_bps,
+                "rx_bps": self.rx_bps,
+                "bytes_up": up_b,
+                "bytes_down": dn_b,
+                "uptime_secs": uptime,
+                "check_code": peer_code or "LIVE-NODE",
+                "forwards": fw_summary,
+            })
+        self.tunnels = tunnels
+
+    def _poll_demo(self):
+        self._demo_tick += 1
+        rx1 = max(20e6, min(105e6, 70.6e6 + self._demo_rng.uniform(-14e6, 16e6)))
+        tx1 = max(8e6, min(45e6, 24.0e6 + self._demo_rng.uniform(-5e6, 6e6)))
+        rx2 = max(2e6, 7.8e6 + self._demo_rng.uniform(-2e6, 2.5e6))
+        tx2 = max(1e6, 2.6e6 + self._demo_rng.uniform(-0.8e6, 1.0e6))
+        self.tx_bps = tx1 + tx2
+        self.rx_bps = rx1 + rx2
+        self.peak_rx_bps = max(self.peak_rx_bps, rx1)
+        self.hist_tx.append(tx1)
+        self.hist_rx.append(rx1)
+        self.scalars = {
+            "links_ready": 64, "streams_active": 57, "adapt_condition": 0,
+            "adaptive_chunk_bytes": 14336, "nlp_last_intent": 0,
+            "nlp_actions_total": 2, "nlp_abstentions_total": 14,
+            "intelligence_mode": 0, "intelligence_predicted_severity": 12,
+            "intelligence_path_score_tenths": 942, "intelligence_measured_goodput_kbps": 78400,
+        }
+        self.status = {"role": "entry", "transport": "faketls+mux", "version": "0.15.1", "uptime_secs": 10800 + self._demo_tick}
+        self.recovery = {
+            "pattern": "healthy", "action": "keep", "chunk_bytes": 14336, "pacing_us": 0,
+            "nlp_intent": "healthy", "nlp_action": "keep_normal", "nlp_confidence": 0.96,
+            "intelligence_mode": "normal", "predicted_severity": 12, "projected_severity": 14,
+            "intelligence_path_score": 94.2, "measured_goodput_kbps": 78400.0, "measured_jitter_ms": 3.1,
+        }
+        self.tunnels = [
+            {
+                "name": "amsterdam", "addr": "198.51.100.10:8443", "port": "8443", "role": "IRAN",
+                "transport": "udp+fec", "up": False, "state": "stopped", "carriers": 0, "streams": 0,
+                "rtt_ms": 0.0, "jitter_ms": 0.0, "loss_pct": 0.0, "tx_bps": 0.0, "rx_bps": 0.0,
+                "bytes_up": 12e9, "bytes_down": 88e9, "uptime_secs": 0, "check_code": "A4K9-2P1X",
+                "forwards": "2053/udp",
+            },
+            {
+                "name": "frankfurt", "addr": "203.0.113.42:8443", "port": "8443", "role": "IRAN",
+                "transport": "faketls+mux", "up": True, "state": "up 3h 0m", "carriers": 4, "streams": 46,
+                "rtt_ms": 84.0, "jitter_ms": 3.1, "loss_pct": 0.40, "tx_bps": tx1, "rx_bps": rx1,
+                "bytes_up": 412.0 * (1024 ** 3), "bytes_down": 1.9 * (1024 ** 4), "uptime_secs": 10800,
+                "check_code": "6Y0-M4S", "forwards": "443 2053/udp 8080=80",
+            },
+            {
+                "name": "helsinki", "addr": "203.0.113.88:443", "port": "443", "role": "IRAN",
+                "transport": "tcpmux", "up": True, "state": "up 1d 2h", "carriers": 4, "streams": 11,
+                "rtt_ms": 61.0, "jitter_ms": 1.8, "loss_pct": 0.10, "tx_bps": tx2, "rx_bps": rx2,
+                "bytes_up": 95.2 * (1024 ** 3), "bytes_down": 640.0 * (1024 ** 3), "uptime_secs": 93600,
+                "check_code": "9R2-Q7L", "forwards": "2000-2010",
+            },
+        ]
+        self.forwards = [
+            {
+                "port": "443", "proto": "tcp", "name": "VLESS", "tunnel": "frankfurt",
+                "target": "127.0.0.1:443", "failover": "helsinki", "state": "on", "users": 38,
+                "bytes_up": 80 * (1024 ** 3), "bytes_down": 332 * (1024 ** 3),
+                "quota_bytes": 1024 ** 4, "rate_bps": 100_000_000, "counted_since": 1791046800,
+                "tx_bps": 16.8e6, "rx_bps": 78.4e6,
+                "active_users": [
+                    {"peer": "5.120.44.18:51522", "proto": "tcp", "age_secs": 180, "bytes_up": 150 * 1048576, "bytes_down": 2 * 1073741824, "tx_bps": 3.6e6, "rx_bps": 32.0e6},
+                    {"peer": "91.98.12.7:40211", "proto": "tcp", "age_secs": 240, "bytes_up": 120 * 1048576, "bytes_down": int(1.6 * 1073741824), "tx_bps": 2.9e6, "rx_bps": 25.6e6},
+                    {"peer": "2.180.9.66:61033", "proto": "tcp", "age_secs": 300, "bytes_up": 90 * 1048576, "bytes_down": int(1.2 * 1073741824), "tx_bps": 2.2e6, "rx_bps": 19.2e6},
+                    {"peer": "151.238.4.90:33012", "proto": "tcp", "age_secs": 360, "bytes_up": 60 * 1048576, "bytes_down": 800 * 1048576, "tx_bps": 1.4e6, "rx_bps": 12.8e6},
+                    {"peer": "37.32.15.200:52001", "proto": "tcp", "age_secs": 420, "bytes_up": 30 * 1048576, "bytes_down": 400 * 1048576, "tx_bps": 720e3, "rx_bps": 6.4e6},
+                ],
+            },
+            {
+                "port": "2053/udp", "proto": "udp", "name": "Games", "tunnel": "frankfurt",
+                "target": "127.0.0.1:2053", "failover": "helsinki", "state": "on", "users": 6,
+                "bytes_up": 4 * (1024 ** 3), "bytes_down": 14 * (1024 ** 3),
+                "quota_bytes": 0, "rate_bps": 0, "counted_since": 1791046800,
+                "tx_bps": 2.4e6, "rx_bps": 7.2e6, "active_users": [],
+            },
+            {
+                "port": "8080=80", "proto": "tcp", "name": "Mirror", "tunnel": "frankfurt",
+                "target": "127.0.0.1:80", "failover": "-", "state": "quota reached", "users": 0,
+                "bytes_up": 10 * (1024 ** 3), "bytes_down": int(40.2 * (1024 ** 3)),
+                "quota_bytes": 50 * (1024 ** 3), "rate_bps": 0, "counted_since": 1791046800,
+                "tx_bps": 0.0, "rx_bps": 0.0, "active_users": [],
+            },
+            {
+                "port": "2000-2010", "proto": "tcp", "name": "-", "tunnel": "helsinki",
+                "target": "127.0.0.1:2000", "failover": "-", "state": "on", "users": 11,
+                "bytes_up": int(1.4 * (1024 ** 3)), "bytes_down": int(5.4 * (1024 ** 3)),
+                "quota_bytes": 0, "rate_bps": 0, "counted_since": 1791046800,
+                "tx_bps": 3.2e6, "rx_bps": 20.0e6, "active_users": [],
+            },
+        ]
+
+
+def safe_add(win, y, x, text, attr=0, max_w=None):
+    h, w = win.getmaxyx()
+    if y < 0 or y >= h or x >= w:
+        return
+    limit = (w - x - 1) if max_w is None else min(max_w, w - x - 1)
+    if limit <= 0:
+        return
+    try:
+        win.addstr(y, x, str(text)[:limit], attr)
+    except curses.error:
+        pass
+
+
+def draw_box_hline(win, y, x, length, attr):
+    safe_add(win, y, x, "─" * max(0, length), attr)
+
+
+def run_shell_interactive(stdscr, cmd_list, pause=True):
+    curses.endwin()
+    os.system("clear")
+    try:
+        subprocess.run(cmd_list, check=False)
+    except Exception as e:
+        print(f"Error: {e}")
+    if pause:
+        input("\nPress Enter to return to Khaymali TUI...")
+    stdscr.clear()
+    stdscr.refresh()
+
+
+def wizard_setup(stdscr, role: str):
+    curses.endwin()
+    os.system("clear")
+    print(f"=== Khaymali Setup: {'Iran (Entry)' if role == 'entry' else 'Kharej (Exit)'} ===\n")
+    kbin = shutil.which("khaymali") or "/usr/local/bin/khaymali"
+    if not os.path.exists(kbin):
+        print("khaymali binary not found in PATH.")
+        input("\nPress Enter to return...")
+        return
+    kp = subprocess.check_output([kbin, "keygen"], text=True)
+    priv = next((l.split()[1] for l in kp.splitlines() if "private" in l.lower()), "")
+    pub = next((l.split()[1] for l in kp.splitlines() if "public" in l.lower()), "")
+    print(kp)
+    if role == "exit":
+        listen = input("Listen address [0.0.0.0:443]: ").strip() or "0.0.0.0:443"
+        allow = input("Entry PUBLIC key to allow (64 hex): ").strip()
+        metrics = input("Metrics bind [127.0.0.1:9110]: ").strip() or "127.0.0.1:9110"
+        if allow and os.geteuid() == 0:
+            os.makedirs("/etc/khaymali", mode=0o700, exist_ok=True)
+            env_path = "/etc/khaymali/exit.env"
+            with open(env_path, "w") as f:
+                f.write(f"KHAYMALI_KEY={priv}\nKHAYMALI_ALLOW_ENTRY_PUB={allow}\nKHAYMALI_LISTEN={listen}\nKHAYMALI_METRICS={metrics}\n")
+            os.chmod(env_path, 0o600)
+            print(f"\nSaved {env_path} (mode 600).")
+            print(f"Exit Public Key (copy to Iran server): {pub}")
+        else:
+            print("\nRun manually on Exit:")
+            print(f"  KHAYMALI_KEY={priv} khaymali exit --listen {listen} --allow <ENTRY_PUB> --metrics {metrics} --control /run/khaymali/exit.sock")
+    else:
+        exit_addr = input("Kharej (Exit) IP:PORT (e.g. 203.0.113.10:443): ").strip()
+        exit_pub = input("Kharej (Exit) PUBLIC key (64 hex): ").strip()
+        socks = input("Local SOCKS5 [127.0.0.1:1080]: ").strip() or "127.0.0.1:1080"
+        pool = input("Pool size [32]: ").strip() or "32"
+        metrics = input("Metrics bind [127.0.0.1:9100]: ").strip() or "127.0.0.1:9100"
+        if exit_addr and exit_pub and os.geteuid() == 0:
+            os.makedirs("/etc/khaymali", mode=0o700, exist_ok=True)
+            env_path = "/etc/khaymali/entry.env"
+            with open(env_path, "w") as f:
+                f.write(f"KHAYMALI_KEY={priv}\nKHAYMALI_EXIT={exit_addr}\nKHAYMALI_EXIT_PUB={exit_pub}\nKHAYMALI_SOCKS={socks}\nKHAYMALI_POOL={pool}\nKHAYMALI_METRICS={metrics}\nKHAYMALI_NLP_MODE=shadow\n")
+            os.chmod(env_path, 0o600)
+            print(f"\nSaved {env_path} (mode 600).")
+            print(f"Entry Public Key (add to Exit --allow): {pub}")
+        else:
+            print("\nRun manually on Entry:")
+            print(f"  KHAYMALI_KEY={priv} khaymali entry --exit {exit_addr or '<EXIT_IP:443>'} --exit-pub {exit_pub or '<EXIT_PUB>'} --socks {socks} --pool {pool} --metrics {metrics} --control /run/khaymali/entry.sock")
+    input("\nPress Enter to return to Khaymali TUI...")
+    stdscr.clear()
+    stdscr.refresh()
+
+
+def run_tui(stdscr, store: DataStore):
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(1000)
+
+    curses.start_color()
+    curses.use_default_colors()
+    # Color pairs matching the dark black + crimson red + muted gray palette
+    curses.init_pair(1, curses.COLOR_WHITE, -1)           # primary text
+    curses.init_pair(2, curses.COLOR_RED, -1)             # red accent / rx rate
+    curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_RED)  # active tab / role badge
+    curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_WHITE) # keycap highlight
+    curses.init_pair(5, curses.COLOR_GREEN, -1)           # ok / healthy
+    curses.init_pair(6, curses.COLOR_YELLOW, -1)          # warn / degraded
+    curses.init_pair(7, curses.COLOR_CYAN, -1)            # subtle info
+
+    c_norm = curses.color_pair(1)
+    c_dim = curses.color_pair(1) | curses.A_DIM
+    c_bold = curses.color_pair(1) | curses.A_BOLD
+    c_red = curses.color_pair(2) | curses.A_BOLD
+    c_badge = curses.color_pair(3) | curses.A_BOLD
+    c_key = curses.color_pair(4)
+    c_ok = curses.color_pair(5) | curses.A_BOLD
+    c_warn = curses.color_pair(6) | curses.A_BOLD
+
+    focus = "main"      # "sidebar" or "main"
+    sidebar_idx = 2     # Manage
+    tab_idx = 2         # TUNNELS
+    sel_tunnel = 1 if store.demo else 0
+    sel_fwd = 0
+    toast = ""
+    toast_until = 0.0
+
+    store.poll()
+    last_poll = time.monotonic()
+
+    while True:
+        now = time.monotonic()
+        if now - last_poll >= 1.0:
+            store.poll()
+            last_poll = now
+
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+
+        if h < 18 or w < 72:
+            safe_add(stdscr, 1, 2, f"Terminal too small ({w}x{h}). Resize to at least 72x18. Press q to quit.", c_red)
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch in (ord("q"), ord("Q")):
+                break
+            continue
+
+        # ---- Top Header Bar ----
+        safe_add(stdscr, 1, 2, "■", c_red)
+        ver = store.status.get("version", "0.15.1")
+        safe_add(stdscr, 1, 4, f"KHAYMALI TUNNEL v{ver}", c_bold)
+        host_lbl = store.hostname
+        safe_add(stdscr, 1, w - len(host_lbl) - 3, host_lbl, c_dim)
+        draw_box_hline(stdscr, 2, 1, w - 2, c_dim)
+
+        # ---- Left Sidebar ----
+        sb_w = 21
+        for y in range(3, h - 3):
+            safe_add(stdscr, y, sb_w, "│", c_dim)
+
+        for idx, (key, label) in enumerate(SIDEBAR_ITEMS):
+            y = 4 + idx
+            is_sel = (idx == sidebar_idx)
+            if is_sel:
+                safe_add(stdscr, y, 2, "▎", c_red)
+                safe_add(stdscr, y, 4, label, c_bold if focus == "sidebar" else c_norm)
+            else:
+                safe_add(stdscr, y, 4, label, c_dim)
+            if key == "manage":
+                cnt = str(len(store.tunnels))
+                safe_add(stdscr, y, sb_w - len(cnt) - 2, cnt, c_dim)
+
+        mode_tag = "demo" if store.demo else ("live" if (store.active_sock or store.active_metrics) else "offline")
+        safe_add(stdscr, h - 5, 4, mode_tag, c_ok if mode_tag == "live" else c_dim)
+
+        # ---- Main Panel Top Tabs & Live Summary ----
+        mx = sb_w + 3
+        mw = w - mx - 2
+        tx = mx
+        for idx, tname in enumerate(TABS):
+            lbl = f" {tname} "
+            if idx == tab_idx:
+                safe_add(stdscr, 4, tx, lbl, c_badge)
+            else:
+                safe_add(stdscr, 4, tx, lbl, c_dim)
+            tx += len(lbl) + 2
+
+        # Right-aligned summary
+        up_cnt = sum(1 for t in store.tunnels if t["up"])
+        tot_cnt = len(store.tunnels)
+        tot_users = sum(int(f.get("users", 0)) for f in store.forwards)
+        if tab_idx == 3:
+            left_sum = f"{tot_users} users"
+        else:
+            left_sum = f"{up_cnt} of {tot_cnt} up"
+        tx_str = f"↑ {fmt_rate(store.tx_bps)}"
+        rx_str = f"↓ {fmt_rate(store.rx_bps)}"
+        rx_x = w - len(rx_str) - 3
+        tx_x = rx_x - len(tx_str) - 2
+        ls_x = tx_x - len(left_sum) - 3
+        if ls_x > tx + 1:
+            safe_add(stdscr, 4, ls_x, left_sum, c_dim)
+            safe_add(stdscr, 4, tx_x, tx_str, c_norm)
+            safe_add(stdscr, 4, rx_x, rx_str, c_red)
+
+        # ---- Tab Body ----
+        if tab_idx == 2:
+            # ================= TAB: TUNNELS =================
+            if store.tunnels:
+                sel_tunnel = max(0, min(sel_tunnel, len(store.tunnels) - 1))
+            hdr = f"   {'Tunnel':<14} {'Role':<7} {'Transport':<12} {'State':<11} {'Carriers':<9} {'Streams':<8} {'RTT':<8} {'↑ Sent':<11} {'↓ Received'}"
+            safe_add(stdscr, 6, mx, hdr, c_dim, mw)
+
+            list_rows = min(len(store.tunnels), max(3, (h - 22) // 2 + 2))
+            for i, t in enumerate(store.tunnels[:list_rows]):
+                y = 7 + i
+                is_cur = (i == sel_tunnel)
+                if is_cur:
+                    safe_add(stdscr, y, mx, "▎", c_red)
+                dot = "●" if t["up"] else "○"
+                dot_c = c_red if (is_cur and t["up"]) else (c_ok if t["up"] else c_dim)
+                safe_add(stdscr, y, mx + 1, dot, dot_c)
+                safe_add(stdscr, y, mx + 3, f"{t['name'][:13]:<14}", c_bold if is_cur else c_norm)
+                safe_add(stdscr, y, mx + 18, f" {t['role'][:4]:<4} ", c_badge if is_cur else c_red)
+                safe_add(stdscr, y, mx + 26, f"{t['transport'][:11]:<12}", c_norm if t["up"] else c_dim)
+                safe_add(stdscr, y, mx + 39, f"{t['state'][:10]:<11}", c_norm if t["up"] else c_dim)
+                if t["up"]:
+                    safe_add(stdscr, y, mx + 51, f"{t['carriers']:<9}", c_norm)
+                    safe_add(stdscr, y, mx + 61, f"{t['streams']:<8}", c_norm)
+                    safe_add(stdscr, y, mx + 70, f"{t['rtt_ms']:>4.0f} ms ", c_norm)
+                    safe_add(stdscr, y, mx + 79, f"{fmt_rate(t['tx_bps']):<11}", c_norm)
+                    safe_add(stdscr, y, mx + 91, fmt_rate(t["rx_bps"]), c_red, max(0, w - (mx + 91) - 2))
+
+            if not store.tunnels:
+                safe_add(stdscr, 8, mx + 2, "No live tunnel detected. Start khaymali with --metrics 127.0.0.1:9100 or run --demo.", c_warn, mw)
+            else:
+                cur = store.tunnels[sel_tunnel]
+                dy = 8 + max(list_rows, 3)
+                safe_add(stdscr, dy, mx, "──", c_dim)
+                safe_add(stdscr, dy, mx + 3, cur["name"], c_bold)
+                safe_add(stdscr, dy, mx + 4 + len(cur["name"]), cur["transport"], c_dim)
+                line_start = mx + 5 + len(cur["name"]) + len(cur["transport"])
+                draw_box_hline(stdscr, dy, line_start, max(0, w - line_start - 3), c_dim)
+
+                # Detail metadata lines
+                safe_add(stdscr, dy + 1, mx + 2, "Check code ", c_dim)
+                safe_add(stdscr, dy + 1, mx + 13, cur["check_code"], c_bold)
+                cc_end = mx + 14 + len(cur["check_code"])
+                safe_add(stdscr, dy + 1, cc_end, "██", c_norm)
+                safe_add(stdscr, dy + 1, cc_end + 2, "██", c_red)
+                safe_add(stdscr, dy + 1, cc_end + 4, "██", c_dim)
+                safe_add(stdscr, dy + 1, mx + 31, f"Port {cur['port']}    Forwards {cur['forwards']}", c_norm, mw - 31)
+
+                safe_add(stdscr, dy + 2, mx + 2, f"All time  ↑ {fmt_bytes(cur['bytes_up'])}  ↓ {fmt_bytes(cur['bytes_down'])}    Uptime {fmt_uptime(cur['uptime_secs'])}", c_dim, mw - 2)
+
+                cond_i = int(store.scalars.get("adapt_condition", 0))
+                cond_s = COND_NAMES[cond_i] if 0 <= cond_i < len(COND_NAMES) else str(cond_i)
+                nlp_i = int(store.scalars.get("nlp_last_intent", 0))
+                nlp_s = store.recovery.get("nlp_intent", NLP_INTENTS[nlp_i] if 0 <= nlp_i < len(NLP_INTENTS) else "healthy")
+                sev = int(store.scalars.get("intelligence_predicted_severity", store.recovery.get("predicted_severity", 0)))
+                safe_add(
+                    stdscr, dy + 3, mx + 2,
+                    f"Latency {cur['rtt_ms']:.0f} ms   Jitter {cur['jitter_ms']:.1f} ms   Loss {cur['loss_pct']:.2f}%   Adapt: {cond_s}   NLP: {nlp_s}   Sev: {sev}/100",
+                    c_norm, mw - 2,
+                )
+
+                # Legend line for mirrored throughput graph
+                gy = dy + 5
+                safe_add(stdscr, gy, mx + 2, "■", c_dim)
+                s_tx = f" Sent {fmt_rate(cur['tx_bps'])}"
+                safe_add(stdscr, gy, mx + 3, s_tx, c_norm)
+                rx_leg_x = mx + 5 + len(s_tx)
+                safe_add(stdscr, gy, rx_leg_x, "■", c_red)
+                s_rx = f" Received {fmt_rate(cur['rx_bps'])}"
+                safe_add(stdscr, gy, rx_leg_x + 1, s_rx, c_norm)
+                safe_add(stdscr, gy, rx_leg_x + 4 + len(s_rx), f"peak {fmt_rate(store.peak_rx_bps)}", c_dim)
+
+                # Mirrored live bar graph (gray up = Sent, red down = Received)
+                g_top = gy + 2
+                g_bot = h - 5
+                avail_h = g_bot - g_top
+                if avail_h >= 4:
+                    tx_rows = max(1, avail_h // 3)
+                    rx_rows = max(2, avail_h - tx_rows)
+                    cols = min(len(store.hist_rx), max(10, (mw - 4) // 2))
+                    tx_vals = list(store.hist_tx)[-cols:]
+                    rx_vals = list(store.hist_rx)[-cols:]
+                    max_tx = max(max(tx_vals, default=1.0), 1e6)
+                    max_rx = max(max(rx_vals, default=1.0), 1e6)
+                    for ci in range(cols):
+                        bx = mx + 2 + ci * 2
+                        th = int(round((tx_vals[ci] / max_tx) * tx_rows))
+                        rh = int(round((rx_vals[ci] / max_rx) * rx_rows))
+                        for r in range(tx_rows):
+                            if tx_rows - r <= th:
+                                safe_add(stdscr, g_top + r, bx, "██", c_dim)
+                        for r in range(rx_rows):
+                            if r < rh:
+                                safe_add(stdscr, g_top + tx_rows + r, bx, "██", c_red)
+
+        elif tab_idx == 3:
+            # ================= TAB: FORWARDED PORTS =================
+            if store.forwards:
+                sel_fwd = max(0, min(sel_fwd, len(store.forwards) - 1))
+            hdr = f"  {'Port':<11} {'Name':<10} {'Tunnel':<12} {'State':<15} {'Users':<7} {'↑':<10} {'↓':<10} {'Used'}"
+            safe_add(stdscr, 6, mx, hdr, c_dim, mw)
+
+            if not store.forwards:
+                safe_add(stdscr, 8, mx + 2, "No L4 port forwards configured. Press 'a' to add one (requires --control socket) or use --demo.", c_dim, mw)
+            else:
+                f_rows = min(len(store.forwards), 5)
+                for i, f in enumerate(store.forwards[:f_rows]):
+                    y = 7 + i
+                    is_cur = (i == sel_fwd)
+                    if is_cur:
+                        safe_add(stdscr, y, mx, "▎", c_red)
+                    st_str = str(f.get("state", "on"))
+                    used_b = float(f.get("bytes_up", 0)) + float(f.get("bytes_down", 0))
+                    q_b = float(f.get("quota_bytes", 0))
+                    used_s = f"{fmt_bytes(used_b)} / {fmt_bytes(q_b)}" if q_b > 0 else fmt_bytes(used_b)
+                    safe_add(stdscr, y, mx + 2, f"{str(f.get('port',''))[:10]:<11}", c_red if is_cur else c_norm)
+                    safe_add(stdscr, y, mx + 14, f"{str(f.get('name','-'))[:9]:<10}", c_bold if is_cur else c_norm)
+                    safe_add(stdscr, y, mx + 25, f"{str(f.get('tunnel','-'))[:11]:<12}", c_norm)
+                    safe_add(stdscr, y, mx + 38, f"{st_str[:14]:<15}", c_red if "quota" in st_str else c_norm)
+                    safe_add(stdscr, y, mx + 54, f"{int(f.get('users',0)):<7}", c_norm)
+                    safe_add(stdscr, y, mx + 62, f"{fmt_rate(f.get('tx_bps',0)):<10}", c_norm)
+                    safe_add(stdscr, y, mx + 73, f"{fmt_rate(f.get('rx_bps',0)):<10}", c_red)
+                    safe_add(stdscr, y, mx + 84, used_s, c_norm, max(0, w - (mx + 84) - 2))
+
+                cf = store.forwards[sel_fwd]
+                dy = 8 + max(f_rows, 4)
+                p_lbl = f"{cf.get('port')}  {cf.get('port')}/{cf.get('proto', 'tcp')}"
+                safe_add(stdscr, dy, mx, "──", c_dim)
+                safe_add(stdscr, dy, mx + 3, p_lbl, c_bold)
+                draw_box_hline(stdscr, dy, mx + 4 + len(p_lbl), max(0, w - (mx + 4 + len(p_lbl)) - 3), c_dim)
+
+                used_b = float(cf.get("bytes_up", 0)) + float(cf.get("bytes_down", 0))
+                q_b = float(cf.get("quota_bytes", 0))
+                bar_w = 12
+                fill = int(min(1.0, used_b / q_b) * bar_w) if q_b > 0 else 4
+                used_bar = "━" * fill + "─" * (bar_w - fill)
+                cs_ts = int(cf.get("counted_since", 0))
+                cs_str = datetime.datetime.fromtimestamp(cs_ts).strftime("%Y-%m-%d %H:%M") if cs_ts > 0 else "-"
+                rate_b = float(cf.get("rate_bps", 0))
+                rate_s = f"{fmt_rate(rate_b)} limit" if rate_b > 0 else "unlimited"
+                details = [
+                    ("Name", str(cf.get("name", "-")), c_bold),
+                    ("State", str(cf.get("state", "on")), c_ok if cf.get("state") == "on" else c_red),
+                    ("Tunnel", str(cf.get("tunnel", "-")), c_norm),
+                    ("Target", str(cf.get("target", "-")), c_norm),
+                    ("Users", str(cf.get("users", 0)), c_norm),
+                    ("Sent / Received", f"{fmt_rate(cf.get('tx_bps', 0))}   {fmt_rate(cf.get('rx_bps', 0))}", c_red),
+                    ("Used", f"{used_bar}  {fmt_bytes(used_b)}" + (f" / {fmt_bytes(q_b)}" if q_b > 0 else ""), c_norm),
+                    ("Counted since", cs_str, c_dim),
+                    ("Speed", rate_s, c_norm),
+                    ("Failover", str(cf.get("failover", "-")), c_norm),
+                ]
+                for idx, (k, v, vc) in enumerate(details):
+                    if dy + 1 + idx < h - 6:
+                        safe_add(stdscr, dy + 1 + idx, mx + 2, f"{k:<16}", c_dim)
+                        safe_add(stdscr, dy + 1 + idx, mx + 19, v, vc, mw - 20)
+
+                uy = dy + len(details) + 2
+                if uy < h - 5:
+                    uhdr = f"{'User':<22} {'Proto':<6} {'Age':<8} {'↑':<10} {'↓':<11} {'Sent':<10} {'Received'}"
+                    safe_add(stdscr, uy, mx + 2, uhdr, c_dim, mw - 2)
+                    users = cf.get("active_users", [])
+                    for ui, u in enumerate(users[: max(0, h - 5 - (uy + 1))]):
+                        ry = uy + 1 + ui
+                        safe_add(stdscr, ry, mx + 2, f"{str(u.get('peer',''))[:21]:<22}", c_norm)
+                        safe_add(stdscr, ry, mx + 25, f"{str(u.get('proto','tcp')):<6}", c_dim)
+                        safe_add(stdscr, ry, mx + 32, f"{fmt_uptime(u.get('age_secs', 0)):<8}", c_norm)
+                        safe_add(stdscr, ry, mx + 41, f"{fmt_rate(u.get('tx_bps', 0)):<10}", c_norm)
+                        safe_add(stdscr, ry, mx + 52, f"{fmt_rate(u.get('rx_bps', 0)):<11}", c_red)
+                        safe_add(stdscr, ry, mx + 64, f"{fmt_bytes(u.get('bytes_up', 0)):<10}", c_norm)
+                        safe_add(stdscr, ry, mx + 75, fmt_bytes(u.get("bytes_down", 0)), c_norm)
+
+        elif tab_idx == 0:
+            # ================= TAB: NODES & INTELLIGENCE =================
+            sc = store.scalars
+            rec = store.recovery
+            cond_i = int(sc.get("adapt_condition", 0))
+            imode_i = int(sc.get("intelligence_mode", 0))
+            nlp_i = int(sc.get("nlp_last_intent", 0))
+            rows = [
+                ("Node Hostname", store.hostname, c_bold),
+                ("Control Socket", store.active_sock or "not connected (run with --control)", c_ok if store.active_sock else c_warn),
+                ("Metrics Endpoint", store.active_metrics or "not connected (run with --metrics)", c_ok if store.active_metrics else c_warn),
+                ("Links Ready / Active Streams", f"{int(sc.get('links_ready', 0))} / {int(sc.get('streams_active', 0))}", c_norm),
+                ("Adaptive Condition", COND_NAMES[cond_i] if 0 <= cond_i < len(COND_NAMES) else str(cond_i), c_ok if cond_i == 0 else c_warn),
+                ("Adaptive Chunk / Pacing", f"{int(sc.get('adaptive_chunk_bytes', rec.get('chunk_bytes', 14336)))} B  /  {rec.get('pacing_us', 0)} us", c_norm),
+                ("TinyNetNlp v4.2 Intent", f"{rec.get('nlp_intent', NLP_INTENTS[nlp_i] if 0 <= nlp_i < len(NLP_INTENTS) else 'healthy')}  (action={rec.get('nlp_action', 'keep_normal')})", c_norm),
+                ("NLP Counters", f"actions={int(sc.get('nlp_actions_total', 0))}  recs={int(sc.get('nlp_recommendations_total', 0))}  abst={int(sc.get('nlp_abstentions_total', 0))}  online={int(sc.get('nlp_online_updates_total', 0))}", c_dim),
+                ("Intelligence Mode & Severity", f"{MODE_NAMES[imode_i] if 0 <= imode_i < len(MODE_NAMES) else imode_i}  |  now={int(sc.get('intelligence_predicted_severity', 0))}/100  proj={int(sc.get('intelligence_projected_severity', 0))}/100", c_norm),
+                ("Path Score & Goodput", f"{sc.get('intelligence_path_score_tenths', 0)/10.0:.1f}/100  |  goodput={int(sc.get('intelligence_measured_goodput_kbps', 0))} kbps  |  jitter={sc.get('intelligence_measured_jitter_tenths_ms', 0)/10.0:.1f} ms", c_norm),
+                ("UDP FEC / Loss", f"fec_recovered={int(sc.get('udp_fec_recovered_total', 0))}  retx={int(sc.get('udp_retransmits_total', 0))}  udp_loss={sc.get('udp_loss_per_mille', 0)/10.0:.1f}%", c_dim),
+            ]
+            safe_add(stdscr, 6, mx, "NODE HEALTH, ADAPTIVE ENGINE & TINYNETNLP v4.2", c_bold)
+            draw_box_hline(stdscr, 7, mx, mw, c_dim)
+            for idx, (k, v, vc) in enumerate(rows):
+                safe_add(stdscr, 8 + idx, mx, f"{k:<30}", c_dim)
+                safe_add(stdscr, 8 + idx, mx + 31, v, vc, mw - 31)
+
+        elif tab_idx == 1:
+            # ================= TAB: CONNECTION TEST =================
+            safe_add(stdscr, 6, mx, "CONNECTION TEST & DIAGNOSTICS", c_bold)
+            draw_box_hline(stdscr, 7, mx, mw, c_dim)
+            safe_add(stdscr, 8, mx, "Press 't' to run live TCP reachability + khaymali doctor check.", c_norm)
+            for idx, line in enumerate(store.conn_test_log[: max(0, h - 15)]):
+                safe_add(stdscr, 10 + idx, mx, line, c_ok if "OK" in line or "PASS" in line else c_norm, mw)
+
+        # ---- Toast Notification ----
+        if toast and now < toast_until:
+            safe_add(stdscr, h - 4, mx, toast, c_warn, mw)
+
+        # ---- Bottom Keybar ----
+        draw_box_hline(stdscr, h - 3, 1, w - 2, c_dim)
+        keys = [("tab", "tabs"), ("↑↓", "choose"), ("enter", "open"), ("r", "refresh"), ("t", "test"), ("esc", "menu"), ("q", "quit")]
+        kx = 2
+        for kcap, kdesc in keys:
+            safe_add(stdscr, h - 2, kx, f" {kcap} ", c_key)
+            kx += len(kcap) + 3
+            safe_add(stdscr, h - 2, kx, kdesc, c_dim)
+            kx += len(kdesc) + 3
+
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == -1:
+            continue
+        if ch in (ord("q"), ord("Q")):
+            break
+        elif ch == 9:  # Tab
+            tab_idx = (tab_idx + 1) % len(TABS)
+            focus = "main"
+        elif ch == 27:  # Esc
+            focus = "sidebar" if focus == "main" else "main"
+        elif ch in (curses.KEY_UP, ord("k")):
+            if focus == "sidebar":
+                sidebar_idx = (sidebar_idx - 1) % len(SIDEBAR_ITEMS)
+            elif tab_idx == 2 and store.tunnels:
+                sel_tunnel = (sel_tunnel - 1) % len(store.tunnels)
+            elif tab_idx == 3 and store.forwards:
+                sel_fwd = (sel_fwd - 1) % len(store.forwards)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            if focus == "sidebar":
+                sidebar_idx = (sidebar_idx + 1) % len(SIDEBAR_ITEMS)
+            elif tab_idx == 2 and store.tunnels:
+                sel_tunnel = (sel_tunnel + 1) % len(store.tunnels)
+            elif tab_idx == 3 and store.forwards:
+                sel_fwd = (sel_fwd + 1) % len(store.forwards)
+        elif ch in (ord("r"), ord("R")):
+            store.poll()
+            toast = "Refreshed live metrics & control socket."
+            toast_until = time.monotonic() + 2.5
+        elif ch in (ord("t"), ord("T")):
+            tab_idx = 1
+            out_lines = [f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Running khaymali doctor..."]
+            kbin = shutil.which("khaymali") or "/usr/local/bin/khaymali"
+            if os.path.exists(kbin):
+                try:
+                    res = subprocess.run([kbin, "doctor"], capture_output=True, text=True, timeout=5)
+                    out_lines.extend(res.stdout.splitlines())
+                except Exception as e:
+                    out_lines.append(f"doctor error: {e}")
+            else:
+                out_lines.append("khaymali binary not found in PATH")
+            for t in store.tunnels:
+                addr = t.get("addr", "")
+                if ":" in addr and not store.demo:
+                    host, _, port = addr.rpartition(":")
+                    t0 = time.monotonic()
+                    try:
+                        s = socket.create_connection((host, int(port)), timeout=2.0)
+                        s.close()
+                        out_lines.append(f"TCP {addr}: OK ({(time.monotonic()-t0)*1000:.1f} ms)")
+                    except Exception as e:
+                        out_lines.append(f"TCP {addr}: FAIL ({e})")
+            store.conn_test_log = out_lines
+        elif ch in (10, 13, curses.KEY_ENTER):
+            if focus == "sidebar":
+                action = SIDEBAR_ITEMS[sidebar_idx][0]
+                if action == "exit":
+                    break
+                elif action == "manage":
+                    focus = "main"
+                elif action == "setup_iran":
+                    wizard_setup(stdscr, "entry")
+                elif action == "setup_kharej":
+                    wizard_setup(stdscr, "exit")
+                elif action == "web_panel":
+                    toast = "Web UI: run `khaymali-web` + `ssh -L 8088:127.0.0.1:8088 root@SERVER`"
+                    toast_until = time.monotonic() + 5.0
+                elif action == "update":
+                    run_shell_interactive(stdscr, ["bash", "-c", "curl -fsSL https://raw.githubusercontent.com/DevSorena/khaymali/main/install.sh | bash"])
+                elif action == "optimize":
+                    run_shell_interactive(stdscr, ["bash", "-c", "curl -fsSL https://raw.githubusercontent.com/DevSorena/khaymali/main/install.sh | bash -s -- --tune"])
+                elif action == "uninstall":
+                    toast = "To uninstall: systemctl stop khaymali-* && rm -f /usr/local/bin/khaymali*"
+                    toast_until = time.monotonic() + 5.0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Khaymali Tunnel Interactive TUI")
+    ap.add_argument("--demo", action="store_true", help="Run with animated demo data")
+    ap.add_argument("--control", default="", help="Path to Khaymali Unix control socket")
+    ap.add_argument("--metrics", default="", help="URL of Prometheus /metrics endpoint")
+    args = ap.parse_args()
+    store = DataStore(demo=args.demo, control_sock=args.control, metrics_url=args.metrics)
+    curses.wrapper(run_tui, store)
+
+
+if __name__ == "__main__":
+    main()
