@@ -64,7 +64,7 @@ if [ "$REVERT_TUNE" -eq 1 ]; then
 fi
 
 command -v systemctl >/dev/null || die "systemd is required."
-[ "$REPO" != "DevSorena/khaymali" ] || die "Set KHAYMALI_REPO=owner/repo before running."
+[ "$REPO" != "OWNER/khaymali" ] || die "Set KHAYMALI_REPO=owner/repo before running."
 
 case "$(uname -m)" in
   x86_64|amd64)  ARCH=amd64 ;;
