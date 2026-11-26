@@ -800,6 +800,15 @@ fn next_rng(state: &mut u64) -> u64 {
     *state
 }
 
+/// v0.15.1: seed-derived outage schedule (phase rng, period, length, first start step).
+fn outage_schedule_start(cfg: &DigitalTwinConfig) -> (u64, usize, usize, usize) {
+    let mut phase_rng = cfg.random_seed ^ 0x9e37_79b9_7f4a_7c15;
+    let period = cfg.outage_period_steps.max(1);
+    let outage_len = cfg.outage_length_steps.min(period);
+    let start = (next_rng(&mut phase_rng) as usize) % period;
+    (phase_rng, period, outage_len, start)
+}
+
 pub fn simulate_packet_twin(
     base: NetworkSample,
     scenario: TwinScenario,
@@ -832,10 +841,7 @@ pub fn simulate_packet_twin(
     // v0.15.1: outage windows start at a seed-derived phase and each period is shifted by a seeded
     // jitter (<= 1/4 period), so strategies cannot overfit a fixed time grid. Deterministic per
     // seed; a separate generator keeps the packet loss/jitter sequence unchanged.
-    let mut phase_rng = cfg.random_seed ^ 0x9e37_79b9_7f4a_7c15;
-    let period = cfg.outage_period_steps.max(1);
-    let outage_len = cfg.outage_length_steps.min(period);
-    let mut outage_start = (next_rng(&mut phase_rng) as usize) % period;
+    let (mut phase_rng, period, outage_len, mut outage_start) = outage_schedule_start(&cfg);
 
     for i in 0..steps {
         if cfg.outage_period_steps > 0 && i >= outage_start + period {
@@ -1012,7 +1018,9 @@ mod tests {
         let a1 = simulate_packet_twin(healthy(), TwinScenario::IntermittentOutage, 400, mk(1)).unwrap();
         let a2 = simulate_packet_twin(healthy(), TwinScenario::IntermittentOutage, 400, mk(1)).unwrap();
         assert_eq!(a1, a2);
-        assert!((2..12u64).any(|s| simulate_packet_twin(healthy(), TwinScenario::IntermittentOutage, 400, mk(s)).unwrap() != a1));
+        let first = outage_schedule_start(&mk(1)).3;
+        assert!((2..40u64).any(|s| outage_schedule_start(&mk(s)).3 != first), "outage phase must depend on the seed");
+        assert!((1..40u64).all(|s| outage_schedule_start(&mk(s)).3 < 40));
     }
 
     #[test]

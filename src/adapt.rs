@@ -852,7 +852,11 @@ impl Adapt {
             }
         }
         if g.extra_pool != extra_before {
-            logs.push(format!("[adapt] pool growth +{} (clients waited {:.0} ms for a link)", g.extra_pool - extra_before, wait_avg));
+            if g.extra_pool > extra_before {
+                logs.push(format!("[adapt] pool growth +{} (clients waited {:.0} ms for a link)", g.extra_pool - extra_before, wait_avg));
+            } else {
+                logs.push(format!("[adapt] pool shrink -{} (calm)", extra_before - g.extra_pool));
+            }
         }
         g.mask = mask;
 

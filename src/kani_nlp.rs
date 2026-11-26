@@ -1809,6 +1809,7 @@ mod tests {
         nlp.push_event_token("loss_burst");
         assert_eq!(nlp.classify("").intent, NetIntent::Throttle);
 
+        nlp.clear_event_window();
         let big = "a".repeat(200_000);
         assert_eq!(nlp.classify(&big).action, DiagnosticAction::KeepNormal);
 
