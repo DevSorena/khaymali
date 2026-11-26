@@ -232,8 +232,7 @@ signature={}
         Ok(Self {
             revision: revision.ok_or_else(|| anyhow::anyhow!("missing revision"))?,
             expires_unix: expires_unix.ok_or_else(|| anyhow::anyhow!("missing expires_unix"))?,
-            payload: body.trim_end_matches('
-').to_string(),
+            payload: body.trim_end_matches('\n').to_string(),
             signature_hex: signature_hex.ok_or_else(|| anyhow::anyhow!("missing signature"))?,
         })
     }
