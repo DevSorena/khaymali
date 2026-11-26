@@ -49,6 +49,7 @@ jobs:
           mkdir -p "$STAGE/deploy" "$STAGE/scripts"
           cp "target/${{ matrix.target }}/release/khaymali" "$STAGE/"
           cp -r deploy/* "$STAGE/deploy/"
+          cp scripts/khaymali-tui "$STAGE/"
           cp scripts/stress_live_300.sh scripts/check_baseline_regression.py scripts/ab_compare.py scripts/eval_nlp_replay.py scripts/make_annotation_set.py "$STAGE/scripts/"
           cp LICENSE README.md SECURITY.md CHANGELOG.md "$STAGE/"
           tar -czf "khaymali-${{ matrix.name }}.tar.gz" "$STAGE"
