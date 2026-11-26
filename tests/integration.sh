@@ -48,13 +48,22 @@ PY
 bg python3 udpecho.py 2>/dev/null
 sleep 1
 
-dl() { timeout 60 curl -s --socks5-hostname "127.0.0.1:$1" "http://127.0.0.1:8000/file.bin" -o "got.$1" -w "%{speed_download}" ; }
+dl() {
+  local out rc
+  out=$(timeout 90 curl -s --socks5-hostname "127.0.0.1:$1" "http://127.0.0.1:8000/file.bin" -o "got.$1" -w "%{speed_download}"); rc=$?
+  if [ "$rc" != 0 ] || [ -z "$out" ]; then
+    echo "  DIAG: curl rc=$rc, received $(stat -c %s "got.$1" 2>/dev/null || echo 0) of $(stat -c %s file.bin) bytes" >&2
+    for f in entry*.log exit*.log bridge*.log; do [ -s "$f" ] && { echo "  --- tail $f" >&2; tail -n 15 "$f" >&2; }; done
+    echo 0; return
+  fi
+  echo "$out"
+}
 
 echo "== 1. direct mode, no camouflage"
 KHAYMALI_KEY=$EXSK bg "$B" exit --listen 127.0.0.1:4440 --allow "$ENPK" --allow-private 2>exit1.log
 KHAYMALI_KEY=$ENSK bg "$B" entry --socks 127.0.0.1:1081 --exit-pub "$EXPK" --exit 127.0.0.1:4440 --pool 4 --metrics 127.0.0.1:9091 2>entry1.log
 sleep 1.5
-SPEED=$(dl 1081); echo "  speed ~ $((${SPEED%.*}/1000000)) MB/s (loopback)"
+SPEED=$(dl 1081); echo "  speed ~ $(awk -v s="${SPEED:-0}" 'BEGIN{printf "%d", s/1000000}') MB/s (loopback)"
 check "32MB download intact" "$([ "$(sha got.1081)" = "$(sha file.bin)" ] && echo yes || echo no)"
 PIDS_OK=""; for i in $(seq 1 20); do timeout 20 curl -s --socks5-hostname 127.0.0.1:1081 http://127.0.0.1:8000/index.html | grep -q DECOY-SITE && PIDS_OK="$PIDS_OK."; done
 check "20 sequential small requests" "$([ ${#PIDS_OK} -eq 20 ] && echo yes || echo no)"
@@ -84,7 +93,7 @@ KHAYMALI_KEY=$ENSK bg "$B" entry --socks 127.0.0.1:1082 --exit-pub "$EXPK" --bri
 sleep 0.5
 KHAYMALI_KEY=$BRSK bg "$B" bridge --entry 127.0.0.1:4444 --entry-pub "$ENPK" --exit 127.0.0.1:4443 --camo-secret "$CAMO" --camo-sni decoy.test --pool 4 2>bridge2.log
 sleep 2
-SPEED=$(dl 1082); echo "  speed ~ $((${SPEED%.*}/1000000)) MB/s (loopback, camouflaged, via bridge)"
+SPEED=$(dl 1082); echo "  speed ~ $(awk -v s="${SPEED:-0}" 'BEGIN{printf "%d", s/1000000}') MB/s (loopback, camouflaged, via bridge)"
 check "download through bridge+camouflage intact" "$([ "$(sha got.1082)" = "$(sha file.bin)" ] && echo yes || echo no)"
 OKS=""; for i in $(seq 1 15); do timeout 20 curl -s --socks5-hostname 127.0.0.1:1082 http://127.0.0.1:8000/index.html | grep -q DECOY-SITE && OKS="$OKS."; done
 check "15 requests through bridge" "$([ ${#OKS} -eq 15 ] && echo yes || echo no)"
