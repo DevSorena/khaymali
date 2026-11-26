@@ -227,7 +227,12 @@ else
       ok "Build provenance attestation verified"
     fi
     tar -xzf "$TMP/$asset" -C "$TMP"
-    install_from_dir "$TMP"
+    # release tarballs contain a top-level khaymali-linux-<arch>/ directory
+    if [ -x "$TMP/khaymali-linux-$ARCH/khaymali" ]; then
+      install_from_dir "$TMP/khaymali-linux-$ARCH"
+    else
+      install_from_dir "$TMP"
+    fi
   fi
 fi
 
@@ -258,16 +263,16 @@ SYSCTL
   ok "Applied optional sysctl tuning (revert via: install.sh --revert-tune)"
 fi
 
-[ -x "$PREFIX/khaymali-manager" ] || die "khaymali-manager was not installed (release archive incomplete)."
-ok "Installed: $("$PREFIX/khaymali" version)"
-echo "  Run diagnostics : khaymali-doctor probe --exit <IP:8443> --json"
-echo "  Open Dashboard  : khaymali-tui   (or: khaymali-tui --demo)"
-echo "  Classic Manager : khaymali-manager"
-echo "  Local Web Panel : khaymali-web   (127.0.0.1:8088)"
+# v0.15.1: the optional helper tools (khaymali-manager / -tui / -web / -doctor) are not part of
+# this release; only the core binary is required. Never fail the install because they are absent.
+[ -x "$PREFIX/khaymali" ] || die "khaymali binary was not installed."
+ok "Installed: $("$PREFIX/khaymali" version 2>/dev/null || echo khaymali)"
+echo "  Host readiness check : khaymali doctor"
+echo "  Generate keys        : khaymali keygen"
+echo "  Help / all commands  : khaymali --help"
+echo "  systemd unit samples : https://github.com/$REPO/tree/main/deploy/systemd"
 if [ -t 0 ] && [ -t 1 ] && [ "${KHAYMALI_NO_MENU:-0}" != 1 ]; then
-  if [ -x "$PREFIX/khaymali-tui" ] && command -v python3 >/dev/null 2>&1; then
-    exec "$PREFIX/khaymali-tui"
-  else
-    exec "$PREFIX/khaymali-manager"
-  fi
+  for f in khaymali-tui khaymali-manager; do
+    if [ -x "$PREFIX/$f" ]; then exec "$PREFIX/$f"; fi
+  done
 fi

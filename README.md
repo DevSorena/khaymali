@@ -101,31 +101,31 @@ RUN_AB=1 REPEATS=3 bash scripts/verify_build_and_tests.sh
 روی هر سرور (خارج، ایران، یا بریج) دستور زیر را با دسترسی `root` اجرا کنید:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/DevSorena/khaymali/main/install.sh)
 ```
 
 ### گزینه‌های اختیاری نصاب
 
 ```bash
 # نصب + بهینه‌سازی اختیاری کرنل (BBR و بافر سوکت با بکاپ خودکار)
-bash <(curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/main/install.sh) --tune
+bash <(curl -fsSL https://raw.githubusercontent.com/DevSorena/khaymali/main/install.sh) --tune
 
 # بازگرداندن تنظیمات کرنل به حالت قبل
-bash <(curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/main/install.sh) --revert-tune
+bash <(curl -fsSL https://raw.githubusercontent.com/DevSorena/khaymali/main/install.sh) --revert-tune
 
 # نصب همراه با بررسی امضای GitHub Build Provenance (نیازمند gh CLI)
-bash <(curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/main/install.sh) --verify-attestation
+bash <(curl -fsSL https://raw.githubusercontent.com/DevSorena/khaymali/main/install.sh) --verify-attestation
 
 # ساخت مستقیم از سورس (--locked) یا نصب بدون باز کردن منو
-KHAYMALI_BUILD=1 bash <(curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/main/install.sh)
-KHAYMALI_NO_MENU=1 bash <(curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/main/install.sh)
+KHAYMALI_BUILD=1 bash <(curl -fsSL https://raw.githubusercontent.com/DevSorena/khaymali/main/install.sh)
+KHAYMALI_NO_MENU=1 bash <(curl -fsSL https://raw.githubusercontent.com/DevSorena/khaymali/main/install.sh)
 ```
 
 ### تأیید دستی اصالت فایل ریلیز
 
 ```bash
 sha256sum -c khaymali-linux-amd64.tar.gz.sha256
-gh attestation verify khaymali-linux-amd64.tar.gz --repo <OWNER>/<REPO>
+gh attestation verify khaymali-linux-amd64.tar.gz --repo DevSorena/khaymali
 ```
 
 پس از نصب، ابزارهای زیر در `/usr/local/bin/` نصب می‌شوند:
@@ -326,7 +326,7 @@ user app ──(SOCKS5 / L4 Forward)──► ENTRY ◄──(reverse dial)─�
 
 ### One-Line Install
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<OWNER>/<REPO>/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/DevSorena/khaymali/main/install.sh)
 ```
 
 ### Build & Verify from Source
