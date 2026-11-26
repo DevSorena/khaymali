@@ -407,6 +407,8 @@ pub struct SessionOwner {
     reattached_notify: Notify,
     /// Woken when an ACK frees space in the un-ACKed send window.
     pub window_notify: Notify,
+    /// Serializes reassembly + forwarding so ready chunks reach the socket in seq order.
+    deliver_lock: tokio::sync::Mutex<()>,
     to_socket_tx: mpsc::Sender<Vec<u8>>,
 }
 
@@ -444,6 +446,7 @@ impl SessionOwner {
             carrier_tx: Mutex::new(None),
             reattached_notify: Notify::new(),
             window_notify: Notify::new(),
+            deliver_lock: tokio::sync::Mutex::new(()),
             to_socket_tx,
         })
     }
@@ -578,6 +581,9 @@ impl SessionOwner {
         if epoch < self.epoch.load(Relaxed) {
             bail!("stale epoch frame dropped");
         }
+        // Order guarantee: concurrent deliveries for this session are serialized from
+        // reassembly until their chunks are queued to the socket.
+        let _ordered = self.deliver_lock.lock().await;
         let chunks = {
             let mut dp = self.dataplane.lock().unwrap();
             dp.process_ack(ack);
