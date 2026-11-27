@@ -67,6 +67,11 @@ jobs:
           for f in install.sh scripts/*.sh tests/*.sh; do
             bash -n "$f"
           done
+      - name: Manager / TUI checks
+        run: |
+          bash -n scripts/khaymali-manager
+          bash tests/manager.sh
+          python3 -m py_compile scripts/khaymali-tui
       - name: Python syntax check
         run: python3 -m py_compile scripts/*.py tests/*.py
       - name: Validate Grafana JSON

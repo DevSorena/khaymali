@@ -153,6 +153,7 @@ fn usage() {
     eprintln!(
         "khaymali {ver}  (Khaymali Tunnel)
 
+  khaymali ui | menu                    live dashboard (TUI) | setup & management menu
   khaymali keygen                       new static keypair + 12-char check code + SHA-256 fingerprint
   khaymali secret                       new random camouflage secret
   khaymali check-code <HEX_PUBKEY>      print UI tag, 12-char check code & full SHA-256 fingerprint
@@ -225,6 +226,16 @@ async fn main() -> Result<()> {
     };
     let a = Args::parse(&argv[1..]);
     match cmd.as_str() {
+        "ui" | "tui" | "menu" | "dashboard" => {
+            // `khaymali ui` -> live dashboard, `khaymali menu` -> setup menu (same look on every server)
+            let tool = if cmd == "menu" { "khaymali-manager" } else { "khaymali-tui" };
+            let rest: Vec<String> = argv[1..].to_vec();
+            let st = std::process::Command::new(tool).args(&rest).status();
+            match st {
+                Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+                Err(e) => bail!("{tool} not found ({e}); reinstall with install.sh or run khaymali-manager update-manager"),
+            }
+        }
         "keygen" => {
             let (sk, pk) = link::keygen()?;
             println!(
@@ -599,7 +610,7 @@ action:     {}",
                 listen_exit: a.get("listen-exit"),
                 tun_if: a.get("tun"),
                 exits,
-                pool: a.num("pool", 8),
+                pool: a.num("pool", 16),
                 max_age: Duration::from_secs(a.num("max-age", 120) as u64),
                 camo,
                 metrics: a.get("metrics"),
@@ -610,7 +621,7 @@ action:     {}",
                 session_resume: !a.flag("no-session-resume"),
                 forwards: parsed_forwards,
                 adapt: !a.flag("no-adapt"),
-                pool_max: a.num("pool-max", (a.num("pool", 8) * 8).clamp(64, 128)),
+                pool_max: a.num("pool-max", (a.num("pool", 16) * 8).clamp(64, 128)),
                 adapt_state: adapt_state_path(&a, "entry"),
             })
             .await?;
@@ -626,7 +637,7 @@ action:     {}",
                 entry: a.req("entry")?,
                 entry_pub,
                 exits,
-                pool: a.num("pool", 8),
+                pool: a.num("pool", 16),
                 camo: a.camo(true)?,
                 metrics: a.get("metrics"),
                 control: a.get("control"),

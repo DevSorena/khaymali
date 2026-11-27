@@ -70,5 +70,14 @@ tar -tzf "$T/evil.tgz" | grep -qvE "^${CONF#/}(/|$)" && ok || bad "foreign archi
 # tuning list only contains key=value pairs
 tune_pairs | grep -qvE '^[a-z0-9_.]+=.+$' && bad "tune_pairs format" || ok
 
+# v0.16.0
+[ "$(list_dedup "k1 k2 k1  k2")" = "k1 k2" ] && ok || bad "dedup keys"
+[ "$(list_add "k1" "k1")" = "k1" ] && ok || bad "no duplicate add"
+J='khaymali://v1?ep=1.2.3.4:443&pk=aa&sni=s&sec=bb&ek=cc&epk=dd'
+[ "$(qparam "$J" ep)" = "1.2.3.4:443" ] && [ "$(qparam "$J" epk)" = dd ] && ok || bad "join params"
+tn "join bad scheme" join_check "http://x"
+[ "$(lc Bridge)" = bridge ] && ok || bad "case-insensitive mode"
+LC_ALL=C grep -q '[^ -~[:space:]]' "$HERE/scripts/khaymali-manager" && bad "manager not ASCII" || ok
+
 echo "manager tests: $PASS passed, $FAILN failed"
 [ "$FAILN" = 0 ]

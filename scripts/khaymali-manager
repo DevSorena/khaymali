@@ -1,251 +1,411 @@
 #!/usr/bin/env bash
-# khaymali-manager — interactive setup & management menu (matches docs/INSTALL.md)
+# khaymali-manager - interactive setup & management menu (ASCII only)
+# v0.16.0: one-command join, automatic key exchange, clock-skew guard (ktime),
+#          de-duplicated keys, case-insensitive input, multi-bridge, larger initial pool.
 set -uo pipefail
-VERSION_MGR="0.15.1"
+VERSION_MGR="0.16.0"
 REPO="${KHAYMALI_REPO:-DevSorena/khaymali}"
-BIN="${KHAYMALI_BIN:-/usr/local/bin/khaymali}"
-ETC=/etc/khaymali
-UNIT=/etc/systemd/system
-BK=/var/backups/khaymali
+BIN="${KHAYMALI_BINPATH:-${KHAYMALI_BIN:-/usr/local/bin/khaymali}}"
+ETC="${KHAYMALI_CONF:-/etc/khaymali}"
+UNIT="${KHAYMALI_UNITDIR:-/etc/systemd/system}"
+BK="${KHAYMALI_BACKUP_DIR:-/var/backups/khaymali}"
+POOL_DEFAULT="${KHAYMALI_POOL:-16}"
+MAX_SKEW=90   # the tunnel rejects >120s; warn earlier
 
 c_g=$'\e[32m'; c_r=$'\e[31m'; c_y=$'\e[33m'; c_b=$'\e[1m'; c_0=$'\e[0m'
+[ -t 1 ] || { c_g=; c_r=; c_y=; c_b=; c_0=; }
 ok(){ echo "${c_g}[ok]${c_0} $*"; }
 warn(){ echo "${c_y}[!]${c_0} $*"; }
 err(){ echo "${c_r}[x]${c_0} $*" >&2; }
 pause(){ [ -t 0 ] && read -rp "Press Enter..." _ ; }
-ask(){ local p="$1" d="${2:-}" v; read -rp "$p${d:+ [$d]}: " v; echo "${v:-$d}"; }
+trim(){ local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; echo "${v%"${v##*[![:space:]]}"}"; }
+ask(){ local p="$1" d="${2:-}" v; read -rp "$p${d:+ [$d]}: " v; v=$(trim "$v"); echo "${v:-$d}"; }
+lc(){ tr '[:upper:]' '[:lower:]' <<<"$1"; }
 need_root(){ [ "$(id -u)" = 0 ] || { err "run as root"; exit 1; }; }
 has_role(){ [ -f "$ETC/$1.conf" ]; }
 roles(){ for r in exit entry bridge; do has_role $r && echo $r; done; }
 metrics_port(){ case $1 in exit) echo 9110;; entry) echo 9109;; bridge) echo 9111;; esac; }
+valid_key(){ [[ "$1" =~ ^[0-9a-f]{64}$ ]]; }
+valid_ipv4(){ local IFS=.; local -a o; read -ra o <<<"$1"; [ ${#o[@]} = 4 ] || return 1
+  for x in "${o[@]}"; do [[ "$x" =~ ^[0-9]{1,3}$ ]] && [ "$x" -le 255 ] || return 1; done; }
+is_private_ip(){ [[ "$1" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.) ]]; }
 
-keypair(){ # prints "PRIV PUB"
-  local o; o=$("$BIN" keygen)
-  echo "$(awk '/^private:/{print $2}' <<<"$o") $(awk '/^public:/{print $2}' <<<"$o")"
-}
+keypair(){ local o; o=$("$BIN" keygen) || return 1
+  echo "$(awk '/^private:/{print $2}' <<<"$o") $(awk '/^public:/{print $2}' <<<"$o")"; }
 myip(){ curl -4 -s -m 6 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}'; }
-conf_get(){ grep -E "^$2=" "$ETC/$1.conf" 2>/dev/null | head -1 | cut -d= -f2-; }
-conf_set(){ local f="$ETC/$1.conf"; touch "$f"; if grep -qE "^$2=" "$f"; then sed -i "s|^$2=.*|$2=$3|" "$f"; else echo "$2=$3" >>"$f"; fi; }
-join_decode(){ # $1 code -> sets J_ep J_pk J_sni J_sec
-  local body="${1#khaymali://v1?}"; J_ep=; J_pk=; J_sni=; J_sec=
-  [ "$body" = "$1" ] && { err "invalid join code"; return 1; }
-  IFS='&' read -ra kv <<<"$body"
-  for p in "${kv[@]}"; do case "${p%%=*}" in ep) J_ep=${p#*=};; pk) J_pk=${p#*=};; sni) J_sni=${p#*=};; sec) J_sec=${p#*=};; esac; done
-  [ -n "$J_ep" ] && [ -n "$J_pk" ] || { err "join code missing ep/pk"; return 1; }
-}
+conf(){ echo "$ETC/$1.conf"; }
+envf(){ echo "$ETC/$1.env"; }
+conf_get(){ grep -E "^$2=" "$ETC/$1.conf" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'; }
+conf_set(){ local f="$ETC/$1.conf"; touch "$f"; chmod 600 "$f"
+  if grep -qE "^$2=" "$f"; then sed -i "s|^$2=.*|$2=\"$3\"|" "$f"; else echo "$2=\"$3\"" >>"$f"; fi; }
+save_kv(){ local f="$1"; shift; touch "$f"; while [ $# -ge 2 ]; do
+  if grep -qE "^$1=" "$f"; then sed -i "s|^$1=.*|$1=\"$2\"|" "$f"; else echo "$1=\"$2\"" >>"$f"; fi; shift 2; done; }
+# strict format: the file is sourced by root
+conf_valid(){ ! grep -vE '^([A-Z_][A-Z0-9_]*="[^"`$;\\]*"|[A-Z_][A-Z0-9_]*=[^"`$;\\ ]*|#.*|)$' "$1" | grep -q .; }
+list_dedup(){ tr ' ' '\n' <<<"$1" | sed '/^$/d' | awk '!s[$0]++' | xargs; }
+list_add(){ list_dedup "$1 $2"; }
+qparam(){ sed -n "s/.*[?&]$2=\([^&]*\).*/\1/p" <<<"$1"; }
+join_check(){ [[ "$1" == khaymali://v1\?* ]] || { err "invalid join code"; return 1; }; }
 
-# ---------- systemd unit generation (from /etc/khaymali/<role>.conf) ----------
+# ---------- forwards ----------
+# spec: PORT | PORT/udp | LOCAL=REMOTE | A-B   optionally @name=X,target=HOST:PORT
+fwd_local_ports(){ local p=${1%%@*}; p=${p%%/*}; p=${p%%=*}
+  if [[ "$p" =~ ^([0-9]+)-([0-9]+)$ ]]; then seq "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"; else echo "$p"; fi; }
+validate_forward(){
+  local s="$1"; [[ "$s" =~ ^[0-9]+(-[0-9]+)?(=[0-9]+)?(/(tcp|udp))?(@[A-Za-z0-9_.,:=-]+)?$ ]] || return 1
+  local sp=${SOCKS:-}; sp=${sp##*:}; local bp=${BRIDGE_LISTEN:-}; bp=${bp##*:}; local mp=${METRICS:-}; mp=${mp##*:} p
+  for p in $(fwd_local_ports "$s"); do [ "$p" = "$sp" ] || [ "$p" = "$bp" ] || [ "$p" = "$mp" ] && return 1; done
+  local tgt; tgt=$(sed -n 's/.*target=\([^,]*\).*/\1/p' <<<"$s")
+  if [ -n "$tgt" ]; then local x; for x in ${EXITS:-} ${EXIT:-}; do
+      [ "$tgt" = "$x" ] && return 1
+      [ "${tgt##*:}" = "${x##*:}" ] && [[ "${tgt%:*}" == 127.* ]] && return 1; done; fi
+  return 0; }
+
+# ---------- clock (fix for "bridge m1 timestamp skew ... outside +-120s") ----------
+ref_time(){ # epoch from an HTTPS Date header: through the tunnel if possible, then direct
+  local d socks u; socks=$(conf_get entry SOCKS)
+  for via in "${socks:+--socks5-hostname $socks}" ""; do
+    for u in https://www.google.com https://www.cloudflare.com ${1:+https://$1}; do
+      # shellcheck disable=SC2086
+      d=$(curl -skI -m 6 $via "$u" 2>/dev/null | grep -i '^date:' | cut -d' ' -f2- | tr -d '\r')
+      [ -n "$d" ] && date -d "$d" +%s 2>/dev/null && return 0
+    done
+  done
+  return 1; }
+clock_skew(){ local r; r=$(ref_time "${1:-}") || { echo "?"; return 1; }; echo $(( $(date +%s) - r )); }
+clock_report(){
+  local s; s=$(clock_skew "${1:-}")
+  if [ "$s" = "?" ]; then warn "clock: no time reference reachable (now $(date -u '+%F %T') UTC)"; return 0; fi
+  if [ "${s#-}" -gt "$MAX_SKEW" ]; then err "clock skew ${s}s (tunnel rejects >120s) -> khaymali-manager fix-clock"; return 1; fi
+  ok "clock skew ${s}s"; }
+install_ktime(){ # for servers without NTP: resync every 10 min (via tunnel when possible)
+  cat >/usr/local/bin/ktime <<'EOF'
+#!/bin/bash
+S=$(grep -E '^SOCKS=' /etc/khaymali/entry.conf 2>/dev/null | cut -d= -f2- | tr -d '"')
+for via in "${S:+--socks5-hostname $S}" ""; do
+  for u in https://www.google.com https://www.cloudflare.com; do
+    D=$(curl -skI -m 10 $via "$u" 2>/dev/null | grep -i '^date:' | cut -d' ' -f2- | tr -d '\r')
+    [ -n "$D" ] && { date -s "$D" >/dev/null; exit 0; }
+  done
+done
+exit 1
+EOF
+  chmod 755 /usr/local/bin/ktime
+  echo "*/10 * * * * root /usr/local/bin/ktime" >/etc/cron.d/khaymali-ktime
+  ok "ktime installed (clock resync every 10 min)"; }
+fix_clock(){
+  if timedatectl set-ntp true 2>/dev/null; then sleep 4
+    [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ] && { ok "NTP enabled and synced"; return 0; }; fi
+  local r; r=$(ref_time "$(conf_get entry EXIT | cut -d: -f1)") || {
+    err "no time reference reachable; set it by hand: date -u -s 'YYYY-MM-DD HH:MM:SS'"; return 1; }
+  timedatectl set-ntp false 2>/dev/null; date -u -s "@$r" >/dev/null && ok "clock set: $(date -u '+%F %T') UTC"
+  install_ktime; }
+ensure_clock(){ # called by every setup
+  if timedatectl set-ntp true 2>/dev/null && [ "$(timedatectl show -p NTP --value 2>/dev/null)" = yes ]; then return 0; fi
+  warn "NTP not available on this server -> using ktime"
+  local s; s=$(clock_skew "${1:-}"); if [ "$s" != "?" ] && [ "${s#-}" -gt 30 ]; then fix_clock; else install_ktime; fi; }
+
+# ---------- systemd ----------
 write_unit(){
-  local role=$1 args=""
+  local role=$1 args="" mp
+  conf_valid "$ETC/$role.conf" || { err "$ETC/$role.conf has invalid lines"; return 1; }
   # shellcheck disable=SC1090
   set -a; . "$ETC/$role.conf"; set +a
-  local mp; mp=$(metrics_port "$role")
+  mp=$(metrics_port "$role"); [ -n "${METRICS:-}" ] && mp=${METRICS##*:}
   case $role in
     exit)
       args="exit --listen ${LISTEN}"
-      for k in ${ALLOW:-}; do args+=" --allow $k"; done
-      args+=" --camo-secret ${CAMO} --camo-fallback ${FALLBACK}"
+      for k in $(list_dedup "${ALLOW:-}"); do args+=" --allow $k"; done
+      [ -n "${CAMO:-}" ] && args+=" --camo-secret ${CAMO} --camo-fallback ${FALLBACK}"
       [ -n "${REVERSE_ENTRY:-}" ] && args+=" --reverse-entry ${REVERSE_ENTRY}" ;;
     entry)
-      args="entry --exit-pub ${EXIT_PUB} --socks ${SOCKS}"
-      if [ "${MODE:-direct}" = bridge ]; then
+      args="entry --exit-pub ${EXIT_PUB} --socks ${SOCKS} --pool ${POOL:-$POOL_DEFAULT} --pool-max ${POOL_MAX:-128}"
+      if [ "$(lc "${MODE:-direct}")" = bridge ]; then
         args+=" --bridge-listen ${BRIDGE_LISTEN}"
-        for k in ${ALLOW_BRIDGE:-}; do args+=" --allow-bridge $k"; done
+        for k in $(list_dedup "${ALLOW_BRIDGE:-}"); do args+=" --allow-bridge $k"; done
       else
-        args+=" --exit ${EXIT} --camo-secret ${CAMO} --camo-sni ${SNI}"
+        for x in ${EXIT:-${EXITS:-}}; do args+=" --exit ${x//,/ --exit }"; done
+        [ -n "${CAMO:-}" ] && args+=" --camo-secret ${CAMO} --camo-sni ${SNI}"
       fi
-      [ -n "${FORWARDS:-}" ] && args+=" --forward ${FORWARDS}" ;;
+      if [ -n "${FORWARDS:-}" ]; then local f; for f in ${FORWARDS//;/ }; do args+=" --forward $f"; done; fi ;;
     bridge)
-      args="bridge --entry ${ENTRY} --entry-pub ${ENTRY_PUB} --exit ${EXIT} --camo-secret ${CAMO} --camo-sni ${SNI}" ;;
+      args="bridge --entry ${ENTRY} --entry-pub ${ENTRY_PUB} --pool ${POOL:-$POOL_DEFAULT} --camo-secret ${CAMO} --camo-sni ${SNI}"
+      for x in ${EXIT//,/ }; do args+=" --exit $x"; done ;;
   esac
-  args+=" --metrics 127.0.0.1:$mp --control /run/khaymali/$role.sock"
+  args+=" --metrics 127.0.0.1:$mp --control /run/khaymali/$role.sock --adapt-state /var/lib/khaymali-$role/adapt.state"
+  mkdir -p "$UNIT"
   cat >"$UNIT/khaymali-$role.service" <<EOF
 [Unit]
 Description=Khaymali $role (managed by khaymali-manager)
-After=network-online.target
+After=network-online.target time-sync.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 EnvironmentFile=$ETC/$role.env
 ExecStart=$BIN $args
 RuntimeDirectory=khaymali
-StateDirectory=khaymali
+RuntimeDirectoryPreserve=yes
+StateDirectory=khaymali-$role
 Restart=always
 RestartSec=3
-LimitNOFILE=65535
+LimitNOFILE=1048576
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
+  chmod 644 "$UNIT/khaymali-$role.service"
   systemctl daemon-reload
 }
 apply_role(){ # validate + restart with rollback
-  local role=$1; local bak="$UNIT/khaymali-$role.service.prev"
+  local role=$1
+  local bak="$UNIT/khaymali-$role.service.prev"
   [ -f "$UNIT/khaymali-$role.service" ] && cp "$UNIT/khaymali-$role.service" "$bak"
-  write_unit "$role"
-  systemctl enable khaymali-$role >/dev/null 2>&1
-  systemctl restart khaymali-$role; sleep 4
-  if systemctl is-active -q khaymali-$role; then ok "khaymali-$role is running"; rm -f "$bak"
+  write_unit "$role" || return 1
+  systemctl enable "khaymali-$role" >/dev/null 2>&1
+  systemctl restart "khaymali-$role"; sleep 4
+  if systemctl is-active -q "khaymali-$role"; then ok "khaymali-$role is running"; rm -f "$bak"
   else
-    err "khaymali-$role failed to start:"; journalctl -u khaymali-$role -n 12 --no-pager -o cat
-    if [ -f "$bak" ]; then warn "rolling back to previous unit"; mv "$bak" "$UNIT/khaymali-$role.service"; systemctl daemon-reload; systemctl restart khaymali-$role; fi
+    err "khaymali-$role failed to start:"; journalctl -u "khaymali-$role" -n 12 --no-pager -o cat
+    if [ -f "$bak" ]; then warn "rolling back to previous unit"; mv "$bak" "$UNIT/khaymali-$role.service"; systemctl daemon-reload; systemctl restart "khaymali-$role"; fi
     return 1
   fi
 }
-save_env(){ umask 077; printf 'KHAYMALI_KEY=%s\nKHAYMALI_NLP_MODE=%s\n' "$2" "${3:-shadow}" >"$ETC/$1.env"; chmod 600 "$ETC/$1.env"; }
+write_env(){ ( umask 077; printf 'KHAYMALI_KEY=%s\nKHAYMALI_NLP_MODE=%s\n' "$2" "${3:-shadow}" >"$ETC/$1.env" ); chmod 600 "$ETC/$1.env"; }
+open_port(){ command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q 'Status: active' && ufw allow "$1" >/dev/null 2>&1; true; }
+path_ok(){ local okc=0; for _ in 1 2 3; do timeout 4 bash -c "echo > /dev/tcp/$1/$2" 2>/dev/null && okc=$((okc+1)); done; [ $okc -ge 2 ]; }
 
-# ---------- 1. EXIT ----------
+# ---------- 1. EXIT (abroad) ----------
+# The Exit pre-generates the Entry keypair and a Bridge keypair and allows both at once,
+# so the Iran side needs ONE paste and nothing has to be copied back.
 setup_exit(){
-  mkdir -p "$ETC"
-  local port fb ip priv pub camo
+  mkdir -p "$ETC"; chmod 700 "$ETC"
+  local port fb ip priv pub camo epriv epub bpriv bpub
   port=$(ask "Listen port" 443); fb=$(ask "Camouflage fallback site" www.microsoft.com:443)
   ip=$(ask "Public IP of this server" "$(myip)")
-  read -r priv pub < <(keypair); camo=$("$BIN" secret | tail -1)
-  save_env exit "$priv"
+  valid_ipv4 "$ip" || warn "IP looks unusual: $ip"
+  read -r priv pub < <(keypair); read -r epriv epub < <(keypair); read -r bpriv bpub < <(keypair)
+  camo=$("$BIN" secret | tail -1)
+  write_env exit "$priv"
   : >"$ETC/exit.conf"
   conf_set exit LISTEN "0.0.0.0:$port"; conf_set exit FALLBACK "$fb"; conf_set exit CAMO "$camo"
-  conf_set exit PUBLIC_IP "$ip"; conf_set exit PUB "$pub"
-  local sni=${fb%%:*}
-  conf_set exit JOIN "\"khaymali://v1?ep=$ip:$port&pk=$pub&sni=$sni&sec=$camo\""
-  command -v ufw >/dev/null && ufw allow "$port/tcp" >/dev/null 2>&1
-  warn "No Entry key allowed yet: the Exit starts after you add one (menu 8)."
-  echo; echo "${c_b}Exit public key:${c_0} $pub"
-  echo "${c_b}Exit join code (secret! copy to the Entry server):${c_0}"
-  echo "  $(conf_get exit JOIN | tr -d '"')"
-  echo; echo "Next: on the Iran/Entry server run khaymali-manager -> 2, paste this code."
+  conf_set exit PUBLIC_IP "$ip"; conf_set exit PUB "$pub"; conf_set exit ALLOW "$epub $bpub"
+  conf_set exit JOIN "khaymali://v1?ep=$ip:$port&pk=$pub&sni=${fb%%:*}&sec=$camo&ek=$epriv&epk=$epub&bk=$bpriv&bpk=$bpub"
+  open_port "$port/tcp"; ensure_clock
+  apply_role exit
+  show_join
+}
+show_join(){
+  local j; j=$(conf_get exit JOIN); [ -z "$j" ] && { warn "no Exit configured here"; return 1; }
+  echo
+  echo "${c_b}=== Paste this ONE command on the Iran server (secret - do not share) ===${c_0}"
+  echo
+  echo "bash <(curl -fsSL https://raw.githubusercontent.com/$REPO/main/install.sh) --join '$j'"
+  echo
+  echo "${c_b}If GitHub is blocked on the Iran server, run this here (on the Exit) instead:${c_0}"
+  echo "  khaymali-manager push root@IRAN_IP"
+  echo
+}
+# copy binary + scripts to the Iran server over SSH and run the join there
+push_to(){
+  local dst="$1" j; j=$(conf_get exit JOIN); [ -z "$dst" ] && dst=$(ask "Iran server (user@ip, or user@ip via jump: -J root@JUMP)")
+  [ -z "$j" ] && { err "set up the Exit first"; return 1; }
+  local files=("$BIN" /usr/local/bin/khaymali-manager); [ -x /usr/local/bin/khaymali-tui ] && files+=(/usr/local/bin/khaymali-tui)
+  # shellcheck disable=SC2086
+  scp ${SSH_OPTS:-} "${files[@]}" "$dst:/usr/local/bin/" && \
+  ssh -t ${SSH_OPTS:-} "$dst" "chmod +x /usr/local/bin/khaymali*; khaymali-manager join '$j'"
 }
 
-# ---------- 2. ENTRY ----------
-setup_entry(){
-  mkdir -p "$ETC"
-  local code mode priv pub
-  code=$(ask "Paste Exit join code"); join_decode "$code" || return 1
-  mode=$(ask "Mode: direct (Entry->Exit) or bridge (Entry<-Bridge->Exit)" direct)
-  read -r priv pub < <(keypair); save_env entry "$priv"
-  : >"$ETC/entry.conf"
-  conf_set entry MODE "$mode"; conf_set entry EXIT_PUB "$J_pk"; conf_set entry EXIT "$J_ep"
-  conf_set entry CAMO "$J_sec"; conf_set entry SNI "${J_sni:-www.microsoft.com}"
-  conf_set entry SOCKS "$(ask 'SOCKS listen' 127.0.0.1:1080)"; conf_set entry PUB "$pub"
-  if [ "$mode" = bridge ]; then
-    local bp ip; bp=$(ask "Port the Bridge connects to (on this server)" 4443); ip=$(ask "Public IP of this server" "$(myip)")
-    conf_set entry BRIDGE_LISTEN "0.0.0.0:$bp"
-    command -v ufw >/dev/null && ufw allow "$bp/tcp" >/dev/null 2>&1
-    echo "${c_b}Bridge join code (secret!):${c_0}"
-    echo "  khaymali://v1?ep=$ip:$bp&pk=$pub&x=$J_ep&xpk=$J_pk&sni=${J_sni}&sec=$J_sec"
-    warn "Entry starts after you add the Bridge public key (menu 8)."
-  else
-    apply_role entry
+# ---------- 2. ENTRY (Iran) ----------
+setup_entry(){ # $1 = join code (optional), $2 = mode (optional)
+  mkdir -p "$ETC"; chmod 700 "$ETC"
+  local code="${1:-}" mode="${2:-}" priv pub ep pk sni sec
+  [ -z "$code" ] && code=$(ask "Paste Exit join code")
+  join_check "$code" || return 1
+  ep=$(qparam "$code" ep); pk=$(qparam "$code" pk); sni=$(qparam "$code" sni); sec=$(qparam "$code" sec)
+  valid_key "$pk" || { err "join code has no valid exit key"; return 1; }
+  priv=$(qparam "$code" ek); pub=$(qparam "$code" epk)
+  if ! valid_key "$priv"; then read -r priv pub < <(keypair); warn "old-style code: on the Exit run  khaymali-manager allow $pub"; fi
+  if [ -z "$mode" ]; then
+    echo "--- testing direct path to $ep ---"
+    if path_ok "${ep%:*}" "${ep##*:}"; then mode=direct; ok "Exit reachable -> DIRECT mode"
+    else warn "Exit NOT reachable from this server (international traffic blocked)"; mode=$(ask "Mode: direct or bridge" bridge); fi
   fi
-  echo; echo "${c_b}Entry public key (add it on the Exit, menu 8):${c_0} $pub"
+  mode=$(lc "$mode"); [ "$mode" = bridge ] || mode=direct
+  write_env entry "$priv"
+  : >"$ETC/entry.conf"
+  conf_set entry MODE "$mode"; conf_set entry EXIT_PUB "$pk"; conf_set entry EXIT "$ep"
+  conf_set entry CAMO "$sec"; conf_set entry SNI "${sni:-www.microsoft.com}"
+  conf_set entry SOCKS "${KHAYMALI_SOCKS:-127.0.0.1:1080}"; conf_set entry PUB "$pub"; conf_set entry POOL "$POOL_DEFAULT"
+  if [ "$mode" = bridge ]; then
+    local bp ip bk bpk; bp=${KHAYMALI_BRIDGE_PORT:-4443}; ip=$(myip)
+    bk=$(qparam "$code" bk); bpk=$(qparam "$code" bpk)
+    conf_set entry BRIDGE_LISTEN "0.0.0.0:$bp"
+    valid_key "$bpk" && conf_set entry ALLOW_BRIDGE "$bpk"
+    open_port "$bp/tcp"
+    echo; echo "${c_b}Run this on the Bridge (an Iran server WITH international access):${c_0}"
+    echo "  khaymali-manager join-bridge 'khaymali://v1?ep=$ip:$bp&pk=$pub&x=$ep&xpk=$pk&sni=${sni}&sec=$sec&bk=$bk&bpk=$bpk'"
+    echo "  (second Bridge for failover: menu 8 -> n)"
+  fi
+  apply_role entry
+  ensure_clock "${ep%:*}"
+  if [ "$mode" = direct ]; then sleep 3; status; fi
 }
 
 # ---------- 3. BRIDGE ----------
 setup_bridge(){
-  mkdir -p "$ETC"
-  local code priv pub x xpk; code=$(ask "Paste Bridge join code"); join_decode "$code" || return 1
-  x=$(sed -n 's/.*[?&]x=\([^&]*\).*/\1/p' <<<"$code"); xpk=$(sed -n 's/.*[?&]xpk=\([^&]*\).*/\1/p' <<<"$code")
-  read -r priv pub < <(keypair); save_env bridge "$priv"
+  mkdir -p "$ETC"; chmod 700 "$ETC"
+  local code="${1:-}" priv pub s
+  [ -z "$code" ] && code=$(ask "Paste Bridge join code")
+  join_check "$code" || return 1
+  priv=$(qparam "$code" bk); pub=$(qparam "$code" bpk)
+  if ! valid_key "$priv"; then read -r priv pub < <(keypair); warn "old-style code: run  khaymali-manager allow $pub  on the Entry AND the Exit"; fi
+  write_env bridge "$priv"
   : >"$ETC/bridge.conf"
-  conf_set bridge ENTRY "$J_ep"; conf_set bridge ENTRY_PUB "$J_pk"; conf_set bridge EXIT "$x"
-  conf_set bridge EXIT_PUB "$xpk"; conf_set bridge CAMO "$J_sec"; conf_set bridge SNI "${J_sni:-www.microsoft.com}"; conf_set bridge PUB "$pub"
+  conf_set bridge ENTRY "$(qparam "$code" ep)"; conf_set bridge ENTRY_PUB "$(qparam "$code" pk)"
+  conf_set bridge EXIT "$(qparam "$code" x)"; conf_set bridge EXIT_PUB "$(qparam "$code" xpk)"
+  s=$(qparam "$code" sni); conf_set bridge CAMO "$(qparam "$code" sec)"; conf_set bridge SNI "${s:-www.microsoft.com}"
+  conf_set bridge PUB "$pub"; conf_set bridge POOL "$POOL_DEFAULT"
+  ensure_clock "$(qparam "$code" x | cut -d: -f1)"
   apply_role bridge
-  echo "${c_b}Bridge public key (add it on the Entry, menu 8; and on the Exit as allowed key):${c_0} $pub"
+  clock_report
+  echo "Bridge public key: $pub"
 }
 
 # ---------- 4. STATUS ----------
 m(){ grep -E "^khaymali_$2 " <<<"$1" | awk '{print $2}' | head -1; }
 status(){
-  local any=0
+  local any=0 r
   for r in $(roles); do
-    any=1; local M; M=$(curl -s -m 3 "127.0.0.1:$(metrics_port $r)/metrics")
-    echo "${c_b}=== $r ===${c_0}  service: $(systemctl is-active khaymali-$r 2>/dev/null)   pubkey: $(conf_get $r PUB | cut -c1-16)…"
-    [ -z "$M" ] && { warn "metrics not reachable"; continue; }
-    printf "  links_ready %-6s streams %s active / %s total   link_fails %s\n" "$(m "$M" links_ready)" "$(m "$M" streams_active)" "$(m "$M" streams_total)" "$(m "$M" link_failures_total)"
-    local dn up; dn=$(m "$M" bytes_down_total); up=$(m "$M" bytes_up_total); dn=${dn%.*}; up=${up%.*}
-    printf "  traffic down %s MB / up %s MB   rtt %s ms   loss %s‰\n" "$(( ${dn:-0} / 1048576 ))" "$(( ${up:-0} / 1048576 ))" "$(m "$M" nlp_link_rtt_ms)" "$(m "$M" nlp_link_loss_per_mille)" 2>/dev/null
-    local it; it=$(m "$M" nlp_last_intent)
-    local names=(healthy early_rst byte_freeze pmtu_drop throttle route_or_dns_fail unrelated)
-    printf "  nlp intent %s   nlp actions %s   reverts %s   camo accepted %s fallback %s\n" "${names[${it:-0}]:-?}" "$(m "$M" nlp_actions_total)" "$(m "$M" nlp_reverts_total)" "$(m "$M" camo_accepted_total)" "$(m "$M" camo_fallback_total)"
-    if [ $r = entry ]; then echo "  exit ip via tunnel: $(curl -s -m 8 --socks5-hostname "$(conf_get entry SOCKS)" https://ifconfig.me)"; fi
+    any=1; local M; M=$(curl -s -m 3 "127.0.0.1:$(metrics_port "$r")/metrics")
+    echo "${c_b}=== $r ===${c_0}  service: $(systemctl is-active "khaymali-$r" 2>/dev/null)   pubkey: $(conf_get "$r" PUB | cut -c1-16)..."
+    if [ -z "$M" ]; then warn "metrics not reachable"; else
+      printf "  links_ready %-6s streams %s active / %s total   link_fails %s\n" "$(m "$M" links_ready)" "$(m "$M" streams_active)" "$(m "$M" streams_total)" "$(m "$M" link_failures_total)"
+      local dn up; dn=$(m "$M" bytes_down_total); up=$(m "$M" bytes_up_total); dn=${dn%.*}; up=${up%.*}
+      printf "  traffic down %s MB / up %s MB   rtt %s ms   loss %s/1000\n" "$(( ${dn:-0} / 1048576 ))" "$(( ${up:-0} / 1048576 ))" "$(m "$M" nlp_link_rtt_ms)" "$(m "$M" nlp_link_loss_per_mille)"
+      local it names=(healthy early_rst byte_freeze pmtu_drop throttle route_or_dns_fail unrelated); it=$(m "$M" nlp_last_intent); it=${it%.*}
+      printf "  nlp intent %s   actions %s   reverts %s   camo accepted %s fallback %s\n" "${names[${it:-0}]:-?}" "$(m "$M" nlp_actions_total)" "$(m "$M" nlp_reverts_total)" "$(m "$M" camo_accepted_total)" "$(m "$M" camo_fallback_total)"
+    fi
+    local sk; sk=$(journalctl -u "khaymali-$r" --since "-2min" --no-pager -o cat 2>/dev/null | grep -o 'timestamp skew [0-9]*s' | tail -1)
+    [ -n "$sk" ] && err "peer rejected because of clock: $sk -> run  khaymali-manager fix-clock  on BOTH servers"
+    [ "$r" = entry ] && echo "  exit ip via tunnel: $(curl -s -m 8 --socks5-hostname "$(conf_get entry SOCKS)" https://ifconfig.me || echo FAILED)"
   done
+  clock_report
   [ $any = 0 ] && warn "no role configured on this server (use 1, 2 or 3)"
+  return 0
 }
 
 # ---------- 8. KEYS ----------
 manage_keys(){
   local r; r=$(roles | head -1); [ -z "$r" ] && { warn "set up a role first"; return; }
-  [ "$(roles | wc -l)" -gt 1 ] && r=$(ask "Role" "$r")
-  local var; case $r in exit) var=ALLOW;; entry) var=ALLOW_BRIDGE;; *) warn "bridge has no allow-list"; return;; esac
-  echo "Allowed keys for $r:"; local i=1; for k in $(conf_get $r $var | tr -d '"'); do echo "  $i) $k"; i=$((i+1)); done
-  echo "  a) add   d) delete   s) show my public key / join code   b) back"
-  case $(ask "Choice" b) in
-    a) local k; k=$(ask "Public key (64 hex)"); [[ "$k" =~ ^[0-9a-f]{64}$ ]] || { err "invalid key"; return; }
-       conf_set $r $var "\"$(conf_get $r $var | tr -d '"') $k\""; apply_role $r ;;
-    d) local n; n=$(ask "Number"); local new; new=$(conf_get $r $var | tr -d '"' | tr ' ' '\n' | sed '/^$/d' | sed "${n}d" | xargs)
-       conf_set $r $var "\"$new\""; apply_role $r ;;
-    s) echo "public: $(conf_get $r PUB)"; [ $r = exit ] && echo "join:   $(conf_get exit JOIN | tr -d '"')" ;;
+  [ "$(roles | wc -l)" -gt 1 ] && r=$(lc "$(ask "Role ($(roles | xargs))" "$r")")
+  local var; case $r in exit) var=ALLOW;; entry) var=ALLOW_BRIDGE;; *) echo "public: $(conf_get bridge PUB)"; return;; esac
+  conf_set "$r" "$var" "$(list_dedup "$(conf_get "$r" "$var")")"   # cleans old duplicates
+  echo "Allowed keys for $r:"; local i=1 k; for k in $(conf_get "$r" "$var"); do echo "  $i) $k"; i=$((i+1)); done
+  echo "  a) add   d) delete   s) show my key / join code   n) new bridge code   b) back"
+  case $(lc "$(ask "Choice" b)") in
+    a) k=$(lc "$(ask "Public key (64 hex)")"); valid_key "$k" || { err "invalid key"; return; }
+       grep -qw "$k" <<<"$(conf_get "$r" "$var")" && { warn "key already allowed"; return; }
+       conf_set "$r" "$var" "$(list_add "$(conf_get "$r" "$var")" "$k")"; apply_role "$r" ;;
+    d) local n; n=$(ask "Number"); [[ "$n" =~ ^[0-9]+$ ]] || return
+       conf_set "$r" "$var" "$(conf_get "$r" "$var" | tr ' ' '\n' | sed '/^$/d' | sed "${n}d" | xargs)"; apply_role "$r" ;;
+    s) echo "public: $(conf_get "$r" PUB)"; [ "$r" = exit ] && show_join ;;
+    n) [ "$r" = entry ] || { warn "only on the Entry (bridge mode)"; return; }
+       local bpriv bpub; read -r bpriv bpub < <(keypair)
+       conf_set entry ALLOW_BRIDGE "$(list_add "$(conf_get entry ALLOW_BRIDGE)" "$bpub")"; apply_role entry
+       echo "1) On the EXIT:       khaymali-manager allow $bpub"
+       echo "2) On the new Bridge: khaymali-manager join-bridge 'khaymali://v1?ep=$(myip):$(conf_get entry BRIDGE_LISTEN | cut -d: -f2)&pk=$(conf_get entry PUB)&x=$(conf_get entry EXIT)&xpk=$(conf_get entry EXIT_PUB)&sni=$(conf_get entry SNI)&sec=$(conf_get entry CAMO)&bk=$bpriv&bpk=$bpub'" ;;
   esac
 }
+allow_key(){ local r v k; k=$(lc "$(trim "$1")"); valid_key "$k" || { err "invalid key"; return 1; }
+  if has_role exit; then r=exit; v=ALLOW; elif has_role entry; then r=entry; v=ALLOW_BRIDGE; else err "no exit/entry here"; return 1; fi
+  grep -qw "$k" <<<"$(conf_get $r $v)" && { ok "already allowed"; return 0; }
+  conf_set $r $v "$(list_add "$(conf_get $r $v)" "$k")"; apply_role $r; }
 
 # ---------- 9. DOCTOR ----------
 doctor(){
-  local host=${1:-} port=${2:-443}
+  local host=${1:-} port=${2:-}
+  if [ -z "$host" ] && has_role entry; then host=$(conf_get entry EXIT | cut -d: -f1); port=$(conf_get entry EXIT | cut -d: -f2); fi
   [ -z "$host" ] && { host=$(ask "Exit IP"); port=$(ask "Port" 443); }
+  port=${port:-443}
   echo "--- host ---"; "$BIN" doctor 2>&1 | tail -5
+  echo "--- clock ---"; clock_report "$host"
   echo "--- path to $host:$port ---"
-  local okc=0; for i in 1 2 3 4 5; do timeout 4 bash -c "echo > /dev/tcp/$host/$port" 2>/dev/null && okc=$((okc+1)); done
+  local okc=0 p; for _ in 1 2 3 4 5; do timeout 4 bash -c "echo > /dev/tcp/$host/$port" 2>/dev/null && okc=$((okc+1)); done
   echo "TCP connects: $okc/5"
-  getent hosts www.google.com >/dev/null && echo "DNS: ok" || warn "DNS: broken (try menu 13 or fix /etc/resolv.conf)"
-  ping -c3 -W2 "$host" 2>/dev/null | tail -1
-  if [ $okc -ge 4 ]; then ok "Verdict: DIRECT mode should work"; elif [ $okc -ge 1 ]; then warn "Verdict: unstable path, try another port or BRIDGE"; else err "Verdict: blocked -> use BRIDGE mode (or another port/IP)"; fi
+  getent hosts www.google.com >/dev/null && echo "DNS: ok" || warn "DNS: broken (fix /etc/resolv.conf)"
+  if [ $okc -ge 4 ]; then ok "Verdict: DIRECT mode should work"
+  elif [ $okc -ge 1 ]; then warn "Verdict: unstable path, try another port or BRIDGE"
+  else err "Verdict: blocked -> BRIDGE mode (through an Iran server that has international access)"
+    for p in 80 443 2053 2083 8080 8443; do timeout 3 bash -c "echo > /dev/tcp/$host/$p" 2>/dev/null && echo "  hint: port $p is OPEN -> move the Exit to port $p"; done
+  fi
 }
 
 # ---------- 10. FORWARDS ----------
 forwards(){
   has_role entry || { warn "forwards live on the Entry server"; return; }
   echo "Current: $(conf_get entry FORWARDS)"
-  local f; f=$(ask "Ports to forward to the Exit side, comma separated (empty = none)" "$(conf_get entry FORWARDS)")
-  for p in ${f//,/ }; do [ "$p" = "$(conf_get entry SOCKS | cut -d: -f2)" ] && { err "loop: $p is the SOCKS port"; return; }; done
+  echo "Format: 443 | 2053/udp | 8080=80 | 2000-2010 | 443@name=VLESS,target=127.0.0.1:443   (separate with ;)"
+  local f s; f=$(ask "Forwards" "$(conf_get entry FORWARDS)")
+  SOCKS=$(conf_get entry SOCKS); BRIDGE_LISTEN=$(conf_get entry BRIDGE_LISTEN); METRICS=127.0.0.1:9109; EXIT=$(conf_get entry EXIT); EXITS=$EXIT
+  for s in ${f//;/ }; do validate_forward "$s" || { err "invalid or looping forward: $s"; return; }; done
   conf_set entry FORWARDS "$f"; apply_role entry
 }
 
-# ---------- 11/12/13/15/16/17 ----------
-edit_cfg(){ local r; r=$(ask "Role" "$(roles | head -1)"); ${EDITOR:-nano} "$ETC/$r.conf"; apply_role "$r"; }
+# ---------- misc ----------
+edit_cfg(){ local r; r=$(lc "$(ask "Role" "$(roles | head -1)")"); ${EDITOR:-nano} "$ETC/$r.conf"; apply_role "$r"; }
+interval_spec(){ case $(lc "$1") in 1hour|hourly) echo hourly;; 1day|daily) echo daily;; 1week|weekly) echo weekly;; *) return 1;; esac; }
 timers(){
-  local r h; r=$(ask "Role" "$(roles | head -1)"); h=$(ask "Daily restart hour (empty = disable)" 4)
-  if [ -z "$h" ]; then systemctl disable --now khaymali-restart-$r.timer 2>/dev/null; rm -f $UNIT/khaymali-restart-$r.*; ok "disabled"; return; fi
-  printf '[Service]\nType=oneshot\nExecStart=/bin/systemctl restart khaymali-%s\n' $r >$UNIT/khaymali-restart-$r.service
-  printf '[Timer]\nOnCalendar=*-*-* %02d:00:00\n[Install]\nWantedBy=timers.target\n' "$h" >$UNIT/khaymali-restart-$r.timer
-  systemctl daemon-reload; systemctl enable --now khaymali-restart-$r.timer && ok "restart daily at $h:00"
+  local r h; r=$(lc "$(ask "Role" "$(roles | head -1)")"); h=$(ask "Daily restart hour (empty = disable)" 4)
+  if [ -z "$h" ]; then systemctl disable --now "khaymali-restart-$r.timer" 2>/dev/null; rm -f "$UNIT/khaymali-restart-$r".*; ok "disabled"; return; fi
+  [[ "$h" =~ ^[0-9]+$ ]] && [ "$h" -lt 24 ] || { err "hour 0-23"; return; }
+  printf '[Service]\nType=oneshot\nExecStart=/bin/systemctl restart khaymali-%s\n' "$r" >"$UNIT/khaymali-restart-$r.service"
+  printf '[Timer]\nOnCalendar=*-*-* %02d:00:00\n[Install]\nWantedBy=timers.target\n' "$h" >"$UNIT/khaymali-restart-$r.timer"
+  systemctl daemon-reload; systemctl enable --now "khaymali-restart-$r.timer" && ok "restart daily at $h:00"
 }
-tune(){
-  cat >/etc/sysctl.d/99-khaymali.conf <<'EOF'
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_slow_start_after_idle = 0
+tune_pairs(){ cat <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.ipv4.tcp_rmem=4096 131072 33554432
+net.ipv4.tcp_wmem=4096 65536 33554432
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_notsent_lowat=131072
+net.core.somaxconn=8192
+net.ipv4.ip_local_port_range=10240 65535
+fs.file-max=2097152
 EOF
-  modprobe tcp_bbr 2>/dev/null; sysctl --system >/dev/null 2>&1; ok "tuning applied: $(sysctl -n net.ipv4.tcp_congestion_control)"; }
+}
+tune(){ tune_pairs | sed 's/=/ = /' >/etc/sysctl.d/99-khaymali.conf; modprobe tcp_bbr 2>/dev/null
+  grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null || sed -i '/congestion_control/d' /etc/sysctl.d/99-khaymali.conf
+  sysctl --system >/dev/null 2>&1; ok "tuning applied: $(sysctl -n net.ipv4.tcp_congestion_control)"; }
 tune_revert(){ rm -f /etc/sysctl.d/99-khaymali.conf; sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1; sysctl --system >/dev/null 2>&1; ok "tuning reverted"; }
-backup(){ mkdir -p "$BK"; local f="$BK/khaymali-$(date +%Y%m%d-%H%M%S).tgz"; tar -czf "$f" -C / etc/khaymali 2>/dev/null && chmod 600 "$f" && ok "backup: $f (contains private keys!)"; }
-restore(){ local f=${1:-}; [ -z "$f" ] && { ls -1 "$BK" 2>/dev/null; f=$(ask "File" "$(ls -1t $BK/*.tgz 2>/dev/null | head -1)"); }
-  tar -xzf "$f" -C / && for r in $(roles); do apply_role $r; done; }
-cleanup(){ journalctl --vacuum-size=100M >/dev/null 2>&1; ls -1t $BK/*.tgz 2>/dev/null | tail -n +6 | xargs -r rm -f; ok "logs vacuumed to 100M, old backups pruned"; df -h / | tail -1; }
+backup_conf(){ mkdir -p "$BK"; local f="$BK/khaymali-conf-$(date +%Y%m%d-%H%M%S).tar.gz"
+  tar -czf "$f" -C "$(dirname "$ETC")" "$(basename "$ETC")" 2>/dev/null && chmod 600 "$f" && { [ "${1:-}" = quiet ] || ok "backup: $f (contains private keys!)"; }; }
+backup(){ backup_conf "$@"; }
+restore(){ local f=${1:-}; [ -z "$f" ] && { ls -1 "$BK" 2>/dev/null; f=$(ask "File" "$(ls -1t "$BK"/*.tar.gz 2>/dev/null | head -1)"); }
+  tar -tzf "$f" | grep -qvE "^$(basename "$ETC")(/|$)" && { err "archive contains foreign paths, refusing"; return 1; }
+  tar -xzf "$f" -C "$(dirname "$ETC")" && for r in $(roles); do apply_role "$r"; done; }
+cleanup(){ journalctl --vacuum-size=100M >/dev/null 2>&1; ls -1t "$BK"/*.tar.gz 2>/dev/null | tail -n +6 | xargs -r rm -f; ok "logs vacuumed to 100M, old backups pruned"; df -h / | tail -1; }
 update(){
   local v; v=${KHAYMALI_VERSION:-$(ask "Version tag (latest ignores pre-releases)" latest)}
-  KHAYMALI_NO_MENU=1 KHAYMALI_VERSION=$v bash <(curl -fsSL "https://raw.githubusercontent.com/$REPO/main/install.sh") || { err "update failed (GitHub blocked? copy the binary with scp)"; return 1; }
-  for r in $(roles); do systemctl restart khaymali-$r; done; ok "updated: $("$BIN" version)"
+  KHAYMALI_NO_MENU=1 KHAYMALI_VERSION=$v bash <(curl -fsSL "https://raw.githubusercontent.com/$REPO/main/install.sh") || { err "update failed (GitHub blocked? use  khaymali-manager push  from the Exit)"; return 1; }
+  update_manager; for r in $(roles); do apply_role "$r"; done; ok "updated: $("$BIN" version)"
 }
-update_manager(){ curl -fsSL "https://raw.githubusercontent.com/$REPO/main/scripts/khaymali-manager" -o /tmp/km && bash -n /tmp/km && install -m755 /tmp/km /usr/local/bin/khaymali-manager && ok "manager updated"; }
-logs(){ local r; r=$(roles | head -1); [ "$(roles | wc -l)" -gt 1 ] && r=$(ask "Role" "$r"); journalctl -u khaymali-$r -n 60 --no-pager -o cat; }
-svc(){ local r; r=$(ask "Role" "$(roles | head -1)"); systemctl "$1" khaymali-$r && ok "$1 khaymali-$r"; }
+update_manager(){ local f; for f in khaymali-manager khaymali-tui; do
+  curl -fsSL "https://raw.githubusercontent.com/$REPO/main/scripts/$f" -o "/tmp/$f" || continue
+  if [ $f = khaymali-manager ]; then bash -n /tmp/$f || continue; fi
+  sed -i 's/\r$//' "/tmp/$f"; install -m755 "/tmp/$f" "/usr/local/bin/$f" && ok "$f updated"; done; }
+logs(){ local r; r=$(roles | head -1); [ "$(roles | wc -l)" -gt 1 ] && r=$(lc "$(ask "Role" "$r")"); journalctl -u "khaymali-$r" -n 60 --no-pager -o cat; }
+svc(){ local r; r=$(lc "$(ask "Role" "$(roles | head -1)")"); systemctl "$1" "khaymali-$r" && ok "$1 khaymali-$r"; }
 uninstall(){ [ "$(ask 'Type YES to remove all khaymali services and config')" = YES ] || return
-  backup; for r in exit entry bridge; do systemctl disable --now khaymali-$r 2>/dev/null; rm -f $UNIT/khaymali-$r.service; done
-  rm -rf "$ETC"; systemctl daemon-reload; ok "removed (binary kept at $BIN)"; }
+  backup; for r in exit entry bridge; do systemctl disable --now "khaymali-$r" 2>/dev/null; rm -f "$UNIT/khaymali-$r.service"; done
+  rm -f /etc/cron.d/khaymali-ktime /usr/local/bin/ktime; rm -rf "$ETC"; systemctl daemon-reload; ok "removed (binary kept at $BIN, backup in $BK)"; }
 
 menu(){
   while true; do
@@ -257,30 +417,40 @@ menu(){
   3) Setup BRIDGE                 11) Edit config (auto-rollback)
   4) Status                       12) Scheduled restart timer
   5) Logs                         13) Kernel tuning / BBR   13r) revert
-  6) Restart service              15) Backup    15r) Restore
-  7) Stop service                 16) Disk & log cleanup
-  8) Manage keys / join code      17) Update binary   17m) Update manager
-                                  99) Uninstall      0) Quit
+  6) Restart service              14) Fix clock (NTP / ktime)
+  7) Stop service                 15) Backup    15r) Restore
+  8) Manage keys / join code      16) Disk & log cleanup
+  p) Push & install on Iran (SSH) 17) Update binary   17m) Update manager
+  t) Live dashboard (TUI)         99) Uninstall      0) Quit
 EOF
-    case $(ask "Choice") in
+    case $(lc "$(ask "Choice")") in
       1) setup_exit;; 2) setup_entry;; 3) setup_bridge;; 4) status;; 5) logs;;
       6) svc restart;; 7) svc stop;; 8) manage_keys;; 9) doctor;; 10) forwards;;
-      11) edit_cfg;; 12) timers;; 13) tune;; 13r) tune_revert;; 14) warn "Telegram alerts: not implemented yet";;
+      11) edit_cfg;; 12) timers;; 13) tune;; 13r) tune_revert;; 14) fix_clock;;
       15) backup;; 15r) restore;; 16) cleanup;; 17) update;; 17m) update_manager;; 99) uninstall;;
+      p) push_to "";;
+      t) if command -v khaymali-tui >/dev/null; then khaymali-tui; else warn "khaymali-tui not installed"; fi;;
       0|q) exit 0;; *) warn "unknown choice";;
     esac
     pause
   done
 }
 
+[ "${KHAYMALI_MANAGER_SOURCED:-0}" = 1 ] && return 0 2>/dev/null
 need_root
 [ -x "$BIN" ] || { err "khaymali binary not found at $BIN"; exit 1; }
-case "${1:-menu}" in
+case "$(lc "${1:-menu}")" in
   menu) menu;;
+  join) setup_entry "${2:-}" "${3:-}";;
+  join-bridge) setup_bridge "${2:-}";;
+  setup-exit) setup_exit;;
+  join-code) show_join;;
+  push) push_to "${2:-}";;
+  allow) allow_key "${2:-}";;
   status) status;; doctor) shift; doctor "$@";; logs) logs;;
+  fix-clock) fix_clock;; clock) clock_report;;
   update) update;; update-manager) update_manager;; backup) backup;; restore) shift; restore "${1:-}";;
   tune) tune;; tune-revert) tune_revert;; tune-status) sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc;;
-  cleanup) cleanup;; notify-test) warn "Telegram alerts: not implemented yet";;
-  version) echo "khaymali-manager $VERSION_MGR";;
-  *) echo "usage: khaymali-manager [menu|status|doctor IP PORT|logs|update|update-manager|backup|restore FILE|tune|tune-revert|tune-status|cleanup]"; exit 2;;
+  cleanup) cleanup;; version) echo "khaymali-manager $VERSION_MGR";;
+  *) echo "usage: khaymali-manager [menu|setup-exit|join CODE [direct|bridge]|join-bridge CODE|join-code|push USER@IP|allow KEY|status|doctor [IP PORT]|fix-clock|clock|logs|update|update-manager|backup|restore FILE|tune|tune-revert|cleanup]"; exit 2;;
 esac

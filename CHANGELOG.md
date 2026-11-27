@@ -2,6 +2,27 @@
 
 All notable changes to Khaymali Tunnel are documented here. Historical version changelogs and audits (`v0.5.0` through `v0.14.0`) are preserved in [`docs/archive/`](docs/archive/).
 
+## [0.16.0] - One-command setup, clock guard, live dashboard
+
+### Fixed (found in the first real Entry <- Bridge -> Exit test)
+- Manager `role: unbound variable` in `apply_role` (line 83); `install.sh` now always installs the latest manager/TUI.
+- Clock skew silently killed every Bridge link (`timestamp skew 1093s`): `status`/`doctor` show the skew, `fix-clock` command, automatic `ktime` cron on servers without NTP, clearer error text in the binary.
+- Duplicate keys in `ALLOW`/`ALLOW_BRIDGE` (deduplicated on every edit; adding an existing key is refused).
+- `Bridge`/`BRIDGE` input accepted (case-insensitive menu choices and modes).
+- Garbled `...`/`/1000` characters: the manager is pure ASCII, the TUI falls back to ASCII on non-UTF-8 terminals (`--ascii`).
+- TUI sidebar actions now call the manager (Setup Iran/Kharej, Update, Optimize were using an outdated wizard).
+
+### Added
+- `install.sh --join CODE` / `--join-bridge CODE`: Exit prints one command; Iran pastes it; keys are pre-exchanged.
+- `khaymali-manager push user@ip`: install on Iran over SSH when GitHub is blocked.
+- Automatic DIRECT/BRIDGE choice from a path test; multi-Bridge failover codes (menu 8 -> n).
+- `khaymali ui` / `khaymali menu` sub-commands.
+- TUI keys: space start/stop, R restart, l link, c clock.
+
+### Changed
+- Default link pool 8 -> 16 (faster ramp-up; Bridge test started at ~4.7 MB/s), `--pool-max 128`.
+- Stronger sysctl tuning profile (32 MB buffers, notsent_lowat, wider port range).
+
 ## [0.15.1] — Runtime safety envelope, model accuracy, honest A/B
 
 > Not compiled in the preparation environment (no Rust toolchain). Run `bash scripts/verify_build_and_tests.sh` before tagging.

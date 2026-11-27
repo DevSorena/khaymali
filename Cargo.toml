@@ -1,8 +1,8 @@
 [package]
 name = "khaymali"
-version = "0.15.1"
+version = "0.16.0"
 edition = "2021"
-description = "Khaymali Tunnel v0.15.1: Entry <-> Bridge <-> Exit censorship-circumvention tunnel with Adaptive XOR-Parity UDP FEC, Auto-Fallback Transport Cascade, Reverse-Dial Mode, Kernel Transparent Source-IP Forwarding, Multi-Flow FakeTLS-Mux (ktunnel), Turbo-Tunnel Session Resume, and Noise_IK"
+description = "Khaymali Tunnel v0.16.0: Entry <-> Bridge <-> Exit censorship-circumvention tunnel with Adaptive XOR-Parity UDP FEC, Auto-Fallback Transport Cascade, Reverse-Dial Mode, Kernel Transparent Source-IP Forwarding, Multi-Flow FakeTLS-Mux (ktunnel), Turbo-Tunnel Session Resume, and Noise_IK"
 license = "MIT"
 readme = "README.md"
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Khaymali Tunnel - hardened one-line installer (SPEC §7)
+# Khaymali Tunnel - hardened one-line installer (SPEC -7)
 #   bash <(curl -fsSL https://raw.githubusercontent.com/DevSorena/khaymali/main/install.sh)
 # Flags:
 #   --tune                 apply optional BBR/socket sysctl tuning (with backup)
@@ -8,6 +8,8 @@
 #   --allow-unverified     continue when no checksum is published (default: fall back to a source build)
 # Env overrides:
 #   KHAYMALI_REPO=owner/repo   KHAYMALI_VERSION=v0.4.0 (default: latest)
+#   --join CODE            install, then configure this server as Entry from the Exit join code
+#   --join-bridge CODE     install, then configure this server as Bridge
 #   KHAYMALI_BIN=/path/to/khaymali   KHAYMALI_BUILD=1   KHAYMALI_NO_MENU=1
 set -euo pipefail
 umask 077   # state/config created here may hold keys: private by default
@@ -25,6 +27,9 @@ ALLOW_UNVERIFIED=0
 LOG="/var/log/khaymali-install.log"
 
 MIRROR=""
+JOIN=""
+JOIN_BRIDGE=""
+JOIN_MODE=""
 while (( $# )); do
   case "$1" in
     --tune) DO_TUNE=1; shift ;;
@@ -36,6 +41,10 @@ while (( $# )); do
     --local=*) KHAYMALI_BIN="${1#*=}"; shift ;;
     --mirror) MIRROR="$2"; shift 2 ;;
     --mirror=*) MIRROR="${1#*=}"; shift ;;
+    --join) JOIN="$2"; shift 2 ;;
+    --join=*) JOIN="${1#*=}"; shift ;;
+    --join-bridge) JOIN_BRIDGE="$2"; shift 2 ;;
+    --mode) JOIN_MODE="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -134,7 +143,7 @@ TMP="$(mktemp -d)"
 BACKUP="$(mktemp -d)"
 trap 'rm -rf "$TMP" "$BACKUP"' EXIT
 
-# Reserve state dir for Phase 3 Manifest anti-rollback (SPEC §2.3)
+# Reserve state dir for Phase 3 Manifest anti-rollback (SPEC -2.3)
 mkdir -p "$STATE_DIR" /etc/khaymali
 chmod 0700 "$STATE_DIR" /etc/khaymali
 
@@ -263,12 +272,15 @@ SYSCTL
   ok "Applied optional sysctl tuning (revert via: install.sh --revert-tune)"
 fi
 
-# install khaymali-manager (menu) if the release did not ship it
-if [ ! -x "$PREFIX/khaymali-manager" ]; then
-  if fetch "https://raw.githubusercontent.com/$REPO/main/scripts/khaymali-manager" "$TMP/khaymali-manager" 2>/dev/null; then
-    install -m 0755 "$TMP/khaymali-manager" "$PREFIX/khaymali-manager" && ok "Installed: khaymali-manager"
+# always install the latest manager + TUI from main (release tarballs may carry an old/buggy menu)
+for f in khaymali-manager khaymali-tui; do
+  if fetch "https://raw.githubusercontent.com/$REPO/main/scripts/$f" "$TMP/$f" 2>/dev/null; then
+    sed -i 's/\r$//' "$TMP/$f"
+    if [ "$f" = khaymali-manager ] && ! bash -n "$TMP/$f"; then say "downloaded $f failed syntax check; keeping existing"; continue; fi
+    install -m 0755 "$TMP/$f" "$PREFIX/$f" && ok "Installed: $f"
   fi
-fi
+done
+command -v python3 >/dev/null 2>&1 || say "python3 not found: live dashboard (khaymali-tui) needs it; the text menu works without it."
 # v0.15.1: the optional helper tools (khaymali-manager / -tui / -web / -doctor) are not part of
 # this release; only the core binary is required. Never fail the install because they are absent.
 [ -x "$PREFIX/khaymali" ] || die "khaymali binary was not installed."
@@ -276,11 +288,14 @@ ok "Installed: $("$PREFIX/khaymali" version 2>/dev/null || echo khaymali)"
 echo "  Host readiness check : khaymali doctor"
 echo "  Generate keys        : khaymali keygen"
 echo "  Menu                 : khaymali-manager"
-echo "  Menu                 : khaymali-manager"
+echo "  Live dashboard       : khaymali-tui"
 echo "  Help / all commands  : khaymali --help"
 echo "  systemd unit samples : https://github.com/$REPO/tree/main/deploy/systemd"
+# one-command setup: install.sh --join 'khaymali://v1?...'  (code printed by the Exit)
+if [ -n "$JOIN" ]; then exec "$PREFIX/khaymali-manager" join "$JOIN" "$JOIN_MODE"; fi
+if [ -n "$JOIN_BRIDGE" ]; then exec "$PREFIX/khaymali-manager" join-bridge "$JOIN_BRIDGE"; fi
 if [ -t 0 ] && [ -t 1 ] && [ "${KHAYMALI_NO_MENU:-0}" != 1 ]; then
-  for f in khaymali-tui khaymali-manager; do
+  for f in khaymali-manager; do
     if [ -x "$PREFIX/$f" ]; then exec "$PREFIX/$f"; fi
   done
 fi

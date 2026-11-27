@@ -31,8 +31,9 @@ DEFAULT_SOCKS = [
 ]
 DEFAULT_METRICS = [
     os.environ.get("KHAYMALI_METRICS_URL", ""),
-    "http://127.0.0.1:9100/metrics",
     "http://127.0.0.1:9109/metrics",
+    "http://127.0.0.1:9111/metrics",
+    "http://127.0.0.1:9100/metrics",
     "http://127.0.0.1:9090/metrics",
     "http://127.0.0.1:9110/metrics",
 ]
@@ -384,6 +385,20 @@ class DataStore:
         ]
 
 
+ASCII_MAP = {"│": "|", "─": "-", "↑": "^", "↓": "v", "▎": ">", "●": "*", "█": "#",
+             "○": "o", "━": "=", "■": "#", "…": "...", "‰": "/1000", "↑↓": "^v", "±": "+-"}
+USE_ASCII = os.environ.get("KHAYMALI_ASCII") == "1" or "UTF-8" not in (
+    os.environ.get("LC_ALL") or os.environ.get("LC_CTYPE") or os.environ.get("LANG") or "").upper().replace("UTF8", "UTF-8")
+
+
+def to_ascii(s: str) -> str:
+    if not USE_ASCII:
+        return s
+    for k, v in ASCII_MAP.items():
+        s = s.replace(k, v)
+    return s.encode("ascii", "replace").decode()
+
+
 def safe_add(win, y, x, text, attr=0, max_w=None):
     h, w = win.getmaxyx()
     if y < 0 or y >= h or x >= w:
@@ -392,13 +407,29 @@ def safe_add(win, y, x, text, attr=0, max_w=None):
     if limit <= 0:
         return
     try:
-        win.addstr(y, x, str(text)[:limit], attr)
+        win.addstr(y, x, to_ascii(str(text))[:limit], attr)
     except curses.error:
         pass
 
 
 def draw_box_hline(win, y, x, length, attr):
     safe_add(win, y, x, "─" * max(0, length), attr)
+
+
+MANAGER = shutil.which("khaymali-manager") or "/usr/local/bin/khaymali-manager"
+
+
+def manager(stdscr, *args):
+    """Run a khaymali-manager sub-command full-screen, then return to the dashboard."""
+    if not os.path.exists(MANAGER):
+        run_shell_interactive(stdscr, ["bash", "-c", "echo 'khaymali-manager not installed'"])
+        return
+    run_shell_interactive(stdscr, [MANAGER, *args])
+
+
+def current_role(store) -> str:
+    return str(store.status.get("role", "")).lower() or next(
+        (r for r in ("entry", "exit", "bridge") if os.path.exists(f"/etc/khaymali/{r}.conf")), "entry")
 
 
 def run_shell_interactive(stdscr, cmd_list, pause=True):
@@ -519,7 +550,7 @@ def run_tui(stdscr, store: DataStore):
 
         # ---- Top Header Bar ----
         safe_add(stdscr, 1, 2, "■", c_red)
-        ver = store.status.get("version", "0.15.1")
+        ver = store.status.get("version", "0.16.0")
         safe_add(stdscr, 1, 4, f"KHAYMALI TUNNEL v{ver}", c_bold)
         host_lbl = store.hostname
         safe_add(stdscr, 1, w - len(host_lbl) - 3, host_lbl, c_dim)
@@ -787,7 +818,7 @@ def run_tui(stdscr, store: DataStore):
 
         # ---- Bottom Keybar ----
         draw_box_hline(stdscr, h - 3, 1, w - 2, c_dim)
-        keys = [("tab", "tabs"), ("↑↓", "choose"), ("enter", "open"), ("r", "refresh"), ("t", "test"), ("esc", "menu"), ("q", "quit")]
+        keys = [("tab", "tabs"), ("↑↓", "choose"), ("enter", "open"), ("space", "start/stop"), ("R", "restart"), ("l", "link"), ("t", "test"), ("c", "clock"), ("esc", "menu"), ("q", "quit")]
         kx = 2
         for kcap, kdesc in keys:
             safe_add(stdscr, h - 2, kx, f" {kcap} ", c_key)
@@ -807,7 +838,7 @@ def run_tui(stdscr, store: DataStore):
             focus = "main"
         elif ch == 27:  # Esc
             focus = "sidebar" if focus == "main" else "main"
-        elif ch in (curses.KEY_UP, ord("k")):
+        elif ch == curses.KEY_UP:
             if focus == "sidebar":
                 sidebar_idx = (sidebar_idx - 1) % len(SIDEBAR_ITEMS)
             elif tab_idx == 2 and store.tunnels:
@@ -821,7 +852,25 @@ def run_tui(stdscr, store: DataStore):
                 sel_tunnel = (sel_tunnel + 1) % len(store.tunnels)
             elif tab_idx == 3 and store.forwards:
                 sel_fwd = (sel_fwd + 1) % len(store.forwards)
-        elif ch in (ord("r"), ord("R")):
+        elif ch == ord(" ") and focus == "main" and not store.demo:
+            role = current_role(store)
+            act = "stop" if subprocess.run(["systemctl", "is-active", "-q", f"khaymali-{role}"]).returncode == 0 else "start"
+            subprocess.run(["systemctl", act, f"khaymali-{role}"])
+            toast = f"{act} khaymali-{role}"
+            toast_until = time.monotonic() + 3.0
+        elif ch == ord("R") and not store.demo:
+            subprocess.run(["systemctl", "restart", f"khaymali-{current_role(store)}"])
+            toast = "restarted"
+            toast_until = time.monotonic() + 3.0
+        elif ch in (ord("l"), ord("L")) and not store.demo:
+            manager(stdscr, "join-code" if current_role(store) == "exit" else "status")
+        elif ch in (ord("e"), ord("E")) and tab_idx == 3 and not store.demo:
+            manager(stdscr, "menu")
+        elif ch in (ord("d"), ord("D"), ord("k"), ord("K")) and focus == "main" and not store.demo:
+            manager(stdscr, "menu")
+        elif ch in (ord("c"), ord("C")) and not store.demo:
+            manager(stdscr, "fix-clock")
+        elif ch == ord("r"):
             store.poll()
             toast = "Refreshed live metrics & control socket."
             toast_until = time.monotonic() + 2.5
@@ -857,27 +906,32 @@ def run_tui(stdscr, store: DataStore):
                 elif action == "manage":
                     focus = "main"
                 elif action == "setup_iran":
-                    wizard_setup(stdscr, "entry")
+                    manager(stdscr, "join")
                 elif action == "setup_kharej":
-                    wizard_setup(stdscr, "exit")
+                    manager(stdscr, "setup-exit")
                 elif action == "web_panel":
-                    toast = "Web UI: run `khaymali-web` + `ssh -L 8088:127.0.0.1:8088 root@SERVER`"
-                    toast_until = time.monotonic() + 5.0
+                    toast = "Web panel: ssh -L 9109:127.0.0.1:9109 root@SERVER, then open http://127.0.0.1:9109/metrics"
+                    toast_until = time.monotonic() + 6.0
                 elif action == "update":
-                    run_shell_interactive(stdscr, ["bash", "-c", "curl -fsSL https://raw.githubusercontent.com/DevSorena/khaymali/main/install.sh | bash"])
+                    manager(stdscr, "update")
                 elif action == "optimize":
-                    run_shell_interactive(stdscr, ["bash", "-c", "curl -fsSL https://raw.githubusercontent.com/DevSorena/khaymali/main/install.sh | bash -s -- --tune"])
+                    manager(stdscr, "tune")
                 elif action == "uninstall":
-                    toast = "To uninstall: systemctl stop khaymali-* && rm -f /usr/local/bin/khaymali*"
-                    toast_until = time.monotonic() + 5.0
+                    manager(stdscr, "menu")
 
 
 def main():
     ap = argparse.ArgumentParser(description="Khaymali Tunnel Interactive TUI")
     ap.add_argument("--demo", action="store_true", help="Run with animated demo data")
+    ap.add_argument("--ascii", action="store_true", help="ASCII-only drawing (for terminals that show garbage)")
     ap.add_argument("--control", default="", help="Path to Khaymali Unix control socket")
     ap.add_argument("--metrics", default="", help="URL of Prometheus /metrics endpoint")
     args = ap.parse_args()
+    global USE_ASCII
+    if args.ascii:
+        USE_ASCII = True
+    if not args.demo and os.geteuid() != 0:
+        print("note: run as root for start/stop/setup actions", file=sys.stderr)
     store = DataStore(demo=args.demo, control_sock=args.control, metrics_url=args.metrics)
     curses.wrapper(run_tui, store)
 

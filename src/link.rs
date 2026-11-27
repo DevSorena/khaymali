@@ -514,7 +514,7 @@ pub async fn auth_respond<S: AsyncRead + AsyncWrite + Unpin>(
     if skew > BRIDGE_MAX_SKEW_SECS {
         stats::BRIDGE_REPLAY_DROPPED.fetch_add(1, Relaxed);
         stats::CLOCK_SKEW_DROPPED.fetch_add(1, Relaxed);
-        bail!("bridge m1 timestamp skew {skew}s outside ±{}s window (check NTP sync)", BRIDGE_MAX_SKEW_SECS);
+        bail!("bridge m1 timestamp skew {skew}s outside +-{}s window: clocks differ, run `khaymali-manager fix-clock` on Entry and Bridge", BRIDGE_MAX_SKEW_SECS);
     }
     // 5. Post-auth replay cache insert (silent close on duplicate: no m2 written)
     if !replay.check_and_insert(&m1) {
