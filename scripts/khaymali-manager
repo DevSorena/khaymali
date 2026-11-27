@@ -80,7 +80,7 @@ EOF
   systemctl daemon-reload
 }
 apply_role(){ # validate + restart with rollback
-  local role=$1 bak="$UNIT/khaymali-$role.service.prev"
+  local role=$1; local bak="$UNIT/khaymali-$role.service.prev"
   [ -f "$UNIT/khaymali-$role.service" ] && cp "$UNIT/khaymali-$role.service" "$bak"
   write_unit "$role"
   systemctl enable khaymali-$role >/dev/null 2>&1
