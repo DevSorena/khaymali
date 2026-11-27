@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Khaymali Tunnel - hardened one-line installer (SPEC ยง7)
+# Khaymali Tunnel - hardened one-line installer (SPEC ง7)
 #   bash <(curl -fsSL https://raw.githubusercontent.com/DevSorena/khaymali/main/install.sh)
 # Flags:
 #   --tune                 apply optional BBR/socket sysctl tuning (with backup)
@@ -134,7 +134,7 @@ TMP="$(mktemp -d)"
 BACKUP="$(mktemp -d)"
 trap 'rm -rf "$TMP" "$BACKUP"' EXIT
 
-# Reserve state dir for Phase 3 Manifest anti-rollback (SPEC ยง2.3)
+# Reserve state dir for Phase 3 Manifest anti-rollback (SPEC ง2.3)
 mkdir -p "$STATE_DIR" /etc/khaymali
 chmod 0700 "$STATE_DIR" /etc/khaymali
 
@@ -263,12 +263,19 @@ SYSCTL
   ok "Applied optional sysctl tuning (revert via: install.sh --revert-tune)"
 fi
 
+# install khaymali-manager (menu) if the release did not ship it
+if [ ! -x "$PREFIX/khaymali-manager" ]; then
+  if fetch "https://raw.githubusercontent.com/$REPO/main/scripts/khaymali-manager" "$TMP/khaymali-manager" 2>/dev/null; then
+    install -m 0755 "$TMP/khaymali-manager" "$PREFIX/khaymali-manager" && ok "Installed: khaymali-manager"
+  fi
+fi
 # v0.15.1: the optional helper tools (khaymali-manager / -tui / -web / -doctor) are not part of
 # this release; only the core binary is required. Never fail the install because they are absent.
 [ -x "$PREFIX/khaymali" ] || die "khaymali binary was not installed."
 ok "Installed: $("$PREFIX/khaymali" version 2>/dev/null || echo khaymali)"
 echo "  Host readiness check : khaymali doctor"
 echo "  Generate keys        : khaymali keygen"
+echo "  Menu                 : khaymali-manager"
 echo "  Help / all commands  : khaymali --help"
 echo "  systemd unit samples : https://github.com/$REPO/tree/main/deploy/systemd"
 if [ -t 0 ] && [ -t 1 ] && [ "${KHAYMALI_NO_MENU:-0}" != 1 ]; then
