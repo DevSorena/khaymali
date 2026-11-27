@@ -1,45 +1,64 @@
-# Khaymali Tunnel v0.15.1 · تانل خایمالی
+# Khaymali Tunnel v0.22.0 · تانل خایمالی
 
-> **تانل سه‌نودی ضدفیلترینگ و متن‌باز (MIT) نوشته‌شده با Rust** — طراحی‌شده برای سرورهای ایران‌اکسس و شبکه‌های محدود، با رمزنگاری سرتاسری `Noise_IK`، استتار TLS با Fallback ایزوله، فوروارد پورت لایه ۴، ابزار تشخیص داخلی (`khaymali doctor`)، هوشمندی شبکه تطبیقی (`TinyNetNlp` v4.3 + کالیبراسیون ریسک + شبیه‌ساز صف)، سرویس‌های `systemd` و داشبورد Grafana.
+> **تانل ضدفیلترینگ متنباز (MIT) نوشتهشده با Rust، نسخهی Pure Tunneling.** برای سرورهای ایراناکسس و شبکههای محدود ساخته شده و این امکانات رو داره: رمزنگاری سرتاسری `Noise_IK`، استتار TLS با Fallback ایزوله، فوروارد پورت لایه ۴، **Tunneling Suite** (GRE/FOU، Spoof، FRP/Backhaul، Xray، SSH، WebSocket)، **Pool و Autopilot** برای جابهجایی خودکار حامل، **Cluster Mesh و Load Balancer**، و **Micro-NLP برای شبکههای سخت**.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Rust 1.75+](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](#ساخت-از-سورس-و-تستها)
-[![Crypto](https://img.shields.io/badge/crypto-Noise__IK-blue.svg)](#۱-تانل-خایمالی-چیست-و-چطور-کار-میکند)
-[![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey.svg)](#۴-نصب-تکخطی)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE) [![Rust 1.75+](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](#۱۰-ساخت-از-سورس-و-تستها) [![Crypto](https://img.shields.io/badge/crypto-Noise__IK-blue.svg)](#۱-تانل-خایمالی-چیست-و-چطور-کار-میکند) [![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey.svg)](#۴-نصب-تکخطی) [![CI](https://github.com/DevSorena/khaymali/actions/workflows/ci.yml/badge.svg)](https://github.com/DevSorena/khaymali/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/DevSorena/khaymali)](https://github.com/DevSorena/khaymali/releases/latest)
 
-[راهنمای کامل فارسی](#-راهنمای-فارسی) · [English Guide](#-english-guide) · [محدودیت‌های شناخته‌شده](#۱۱-محدودیتهای-شناختهشده-صادقانه) · [مستند فنی (SPEC)](docs/SPEC.md)
+[راهنمای کامل فارسی](#-راهنمای-فارسی) · [English Guide](#-english-guide) · [محدودیتهای شناختهشده](#۱۱-محدودیتهای-شناختهشده-صادقانه) · [CHANGELOG](CHANGELOG.md) · [Tunneling Suite](docs/KHAYMALI_TUNNELING_SUITE.md) · [Pool & Autopilot](docs/POOL_AUTOPILOT.md) · [مستند فنی (SPEC)](docs/SPEC.md)
 
 ---
 
 # 🇮🇷 راهنمای فارسی
 
+## تازههای v0.22.0
 
-## وضعیت پایداری ماژول‌ها (v0.15.1)
+- **فقط تونل:** پنل وب Go (حدود ۳۷ مگابایت)، ماژول فروش و سهمیهی مشتری (`customers.rs`) و همهی بخشهای مربوط به پنل حذف شدن.
+- **Micro-NLP زنده برای شبکههای سخت:** `harsh_nlp` مستقیم به `AdaptiveRuntime` وصل شده. با دستورهای `khaymali harsh-nlp status` و `khaymali harsh-nlp mode shadow|active` میشه حین اجرا کنترلش کرد.
+- **منوی Tunneling Suite:** گزینهی `ts` به `khaymali-manager` اضافه شده و توی `khaymali --help` همهی دستورهای تونل توضیح داده شدن.
+- **Tunneling Suite کامل (از v0.19 تا v0.20):** Spoof Carrier، Cluster Mesh، Live Carrier Swap، مدیریت FRP و Backhaul با Setup Bundleهای `hsh1_`، `bh1_` و `gh1_`، Xray-Core (REALITY/WS/KCP)، SSH Forward، Cluster LB، DNS Rotation و Node Fleet.
+- **Pool و Autopilot:** چند حامل با حالتهای `failover`، `balance`، `sticky`، `latency` و `least`. اگه تونل قطع بشه، Autopilot با کمک `pathtest` خودش به سریعترین حامل سالم جابهجا میشه و اگه موفق نشد، تغییر رو برمیگردونه.
+
+جزئیات کامل توی [`CHANGELOG.md`](CHANGELOG.md) هست.
+
+## وضعیت پایداری ماژولها (v0.22.0)
 
 | بخش | وضعیت | توضیح |
-| :--- | :---: | :--- |
-| هسته تونل (`Noise_IK`، Entry/Bridge/Exit، SOCKS5، L4 Forward، Mux) | **پایدار (RC)** | رمزنگاری سرتاسری، ضد-SSRF و گیت‌های تست امنیتی منفی |
-| استتار FakeTLS + Fallback به Decoy | **پایدار (RC)** | دارای شکاف شناخته‌شده پروب HTTP ساده (بخش ۱۱) |
-| انتقال UDP + Adaptive XOR-Parity FEC | **بتا** | با برآوردگر واقعی پکت‌لاس و بازیابی ۰-RTT |
-| هوشمندی شبکه (`TinyNetNlp` v4.3، کالیبراسیون، `PathIntelligence`) | **بتا (Opt-in)** | پیش‌فرض `shadow`؛ فعال‌سازی با `KHAYMALI_NLP_MODE=active` و `KHAYMALI_PATH_INTEL=active` |
-| ماژول کرنل `experimental/ktunnel` | **آزمایشی** | خارج از مسیر پیش‌فرض بیلد |
+| :-- | :-: | :-- |
+| هستهی تونل (`Noise_IK`، Entry/Bridge/Exit، SOCKS5، L4 Forward، Mux) | **پایدار (RC)** | رمزنگاری سرتاسری، ضد-SSRF و تستهای امنیتی منفی |
+| استتار FakeTLS + Fallback به Decoy | **پایدار (RC)** | یه شکاف شناختهشده در برابر پروب HTTP ساده داره (بخش ۱۱) |
+| انتقال UDP + Adaptive XOR-Parity FEC | **بتا** | با برآوردگر واقعی پکتلاس و بازیابی ۰-RTT |
+| WebSocket Transport، Session Resume | **بتا** | |
+| Pool، Autopilot، Pathtest، Carrier Swap | **بتا** | جابهجایی خودکار، Rollback و Cooldown |
+| Tunneling Suite (GRE/FOU، 6to4، Spoof، FRP، Backhaul، Xray، SSH) | **بتا** | هر کدوم رو قبل از استفاده توی محیط حساس جداگانه تست کنید |
+| Cluster Mesh، Cluster LB، Node Fleet | **بتا** | |
+| هوشمندی شبکه (`TinyNetNlp`، `harsh_nlp`، `PathIntelligence`) | **بتا (Opt-in)** | پیشفرض `shadow` هست |
+| ماژول کرنل `experimental/ktunnel` | **آزمایشی** | توی مسیر پیشفرض بیلد نیست |
 
-## هوشمندی شبکه در v0.15.1 (حفاظ اقدام)
+## هوشمندی شبکه (حفاظ اقدام)
 
-NLP به‌طور پیش‌فرض در حالت `shadow` است و فقط گزارش می‌دهد. با `KHAYMALI_NLP_MODE=active` فقط دو پارامتر محدود (اندازه چانک و pacing) را تغییر می‌دهد، آن هم با این حفاظ‌ها:
+NLP بهطور پیشفرض توی حالت `shadow` هست و فقط گزارش میده.
 
-* حداکثر **۶ تغییر در دقیقه** و هر بار فقط **یک تغییر در حال ارزیابی**.
-* قبل از هر تغییر، نرخ موفقیت و goodput ثبت می‌شود. اگر بعد از تغییر نرخ موفقیت **۱۰ واحد** یا goodput **۲۵٪** افت کند، تغییر **خودکار برمی‌گردد** و آن نوع اقدام **۱۰ دقیقه قفل** می‌شود.
-* هر اقدام یک خط `[nlp] ...` در لاگ می‌نویسد: دلیل، کلمه‌های مؤثر، مقدار قبل و بعد.
-* شمارنده‌ها: `khaymali_nlp_reverts_total`، `khaymali_nlp_rate_limited_total`، `khaymali_nlp_persist_failures_total`.
+**`TinyNetNlp`:** با `KHAYMALI_NLP_MODE=active` فقط اندازهی چانک و pacing رو تغییر میده، اونم با این محدودیتها:
+- حداکثر **۶ تغییر در دقیقه**
+- هر بار فقط **یک تغییر** در حال ارزیابی
+- اگه نرخ موفقیت **۱۰ واحد** یا goodput **۲۵٪** افت کنه، تغییر خودکار برمیگرده و اون نوع اقدام **۱۰ دقیقه قفل** میشه
 
-قبل از روشن کردن active، مقایسه A/B را اجرا کنید (هر پروفایل ۳ بار):
+**`harsh_nlp` (جدید در v0.22):** شش وضعیت شبکه رو تشخیص میده: `Clean`، `Congested`، `LossyBurst`، `MtuBlackhole`، `DpiReset` و `SevereThrottling`. بر اساس اونها حامل، چانک، pacing، FEC و MTU رو پیشنهاد میده یا اعمال میکنه. اگه وضعیت بدتر بشه، تغییر خودکار برمیگرده و **۱۸۰ ثانیه** قفل میشه.
+
+```bash
+khaymali harsh-nlp status
+khaymali harsh-nlp mode active     # بعد از A/B
+khaymali harsh-nlp mode shadow
+```
+
+قبل از روشن کردن active، مقایسهی A/B رو اجرا کنید:
 
 ```bash
 RUN_AB=1 REPEATS=3 bash scripts/verify_build_and_tests.sh
+sudo bash scripts/stress_harsh_300_ab.sh       # ۲۰۰ و ۳۰۰ کاربر همزمان، پروفایلهای good/bad/harsh
 ```
 
-اگر `ab_compare.py` بگوید پروفایل `clean` بدتر شده (کد خروج ۱)، active را روشن نکنید. برای ارتقای مدل، داده برچسب‌خورده دستی بسازید (`scripts/make_annotation_set.py`)؛ برچسب پروفایل، برچسب درست هر خط نیست.
+اگه `ab_compare.py` گفت پروفایل `clean` بدتر شده (کد خروج ۱)، active رو روشن نکنید.
 
 ## ۱. تانل خایمالی چیست و چطور کار می‌کند؟
 
@@ -129,7 +148,7 @@ gh attestation verify khaymali-linux-amd64.tar.gz --repo DevSorena/khaymali
 ```
 
 پس از نصب، ابزارهای زیر در `/usr/local/bin/` نصب می‌شوند:
-`khaymali` · `khaymali-tui` · `khaymali-manager` · `khaymali-doctor` · `khaymali-web`
+`khaymali` · `khaymali-tui` · `khaymali-manager`
 
 ---
 
@@ -249,7 +268,6 @@ khaymali entry \
 ```bash
 khaymali-tui                                   # داشبورد زنده مشکی-قرمز
 khaymali-tui --demo                            # پیش‌نمایش تعاملی
-khaymali-web --listen 127.0.0.1:8088           # وب‌پنل محلی با توکن Bearer
 echo '{"method":"status"}' | socat - UNIX-CONNECT:/run/khaymali/entry.sock
 echo '{"method":"forwards.list"}' | socat - UNIX-CONNECT:/run/khaymali/entry.sock
 echo '{"method":"drain"}' | socat - UNIX-CONNECT:/run/khaymali/entry.sock
