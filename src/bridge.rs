@@ -36,13 +36,12 @@ pub struct BridgeCfg {
 }
 
 pub async fn run(cfg: BridgeCfg) -> Result<()> {
-    let has_udp = cfg.exits.iter().any(|e| e.starts_with("udp://") || e.starts_with("ktunnel://"));
-    let tx_impl: Arc<dyn Transport> = if has_udp {
-        let udp_auth_key = cfg
-            .camo
-            .as_ref()
-            .map(|c| c.secret.clone())
-            .ok_or_else(|| anyhow::anyhow!("udp:// and ktunnel:// exits require --camo-secret"))?;
+    let has_multi = transport::needs_multi_transport(&cfg.exits);
+    let tx_impl: Arc<dyn Transport> = if has_multi {
+        if transport::requires_carrier_secret(&cfg.exits) && cfg.camo.is_none() {
+            anyhow::bail!("udp://, ktunnel://, and wss:// exits require --camo-secret");
+        }
+        let udp_auth_key = cfg.camo.as_ref().map(|c| c.secret.clone()).unwrap_or_default();
         Arc::new(AutoTransport {
             camo: cfg.camo.clone(),
             udp_auth_key,

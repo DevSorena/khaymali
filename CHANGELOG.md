@@ -1,6 +1,70 @@
+## [0.22.0] - Pure Tunneling Edition (Web Panel Stripped & Live Micro-NLP Integration)
+
+- **Pure Tunneling Only**: Removed the bundled `panel/` directory (~37 MB Go web panel binaries & source), `src/customers.rs` (reseller billing/quota module), and all panel-only HTTP/UI hooks from `ops_suite.rs`, `node_cluster.rs`, `main.rs`, and `scripts/khaymali-manager`.
+- **Live Harsh-Network Micro-NLP Wiring**: Connected `harsh_nlp::HarshNlpController` directly into `AdaptiveRuntime` (`src/recovery.rs`) and Unix-socket RPC (`src/control.rs`: `harsh_nlp.status`, `harsh_nlp.mode`), controllable live via `khaymali harsh-nlp status` and `khaymali harsh-nlp mode shadow|active`.
+- **Manager & CLI Completion**: Updated `khaymali --help` (`usage()`) to document the complete tunneling command set and added an interactive `Tunneling Suite` (`ts`) menu in `scripts/khaymali-manager` (100% ASCII, passing `tests/manager.sh`).
+
+## [0.20.0] - Complete Khaymali Tunneling Suite Port (Phases 1-6) & Harsh-Network Micro-NLP
+
+### Phase 3: Cluster Load Balancer, Multi-Hub Sync, DNS Rotation & Node Fleet
+- **Cluster LB, Sync & DNS (`src/cluster_lb.rs`)**: 5 LB scheduling modes (`failover`, `balance`, `sticky`, `latency` with streak=10 hysteresis, `least`), live async Tokio TCP LB forwarder, deterministic `127.10.x.y` private bind allocator, `frps`/`backhaul` bind rewriters, nftables LB rule generator, AES-256-GCM sealed multi-hub tunnel delivery, and weighted multi-hub DNS rotation.
+- **Node Link, Relay, Migration & Fleet (`src/node_cluster.rs`)**: Bounded JSON `NodeFrame` framing over Tokio, HMAC-SHA256 challenge auth, strict API allowlist HTTP relay, signed `NodeMigrateOffer` zero-downtime migration, and `NodeFleet` registry with live TCP latency probing.
+
+### Phase 4: SSH Forward, Xray-Core Engine, Sentinel, Full Doctor, Kernel Perf & Hardening
+- **SSH Forward & Bagher Key Lock (`src/sshfwd.rs`)**: `SshFwdConfig` persistence, locked `authorized_keys` (`command="/bin/false",restrict,port-forwarding` + `permitopen`), legacy key lock upgrader, systemd unit generator, and companion `frps` config.
+- **Xray-Core Engine (`src/xray_engine.rs`)**: UUID v4 & REALITY X25519 keygen, 5 censorship-resistant presets (`reality-vision`, `reality-grpc`, `reality-xhttp`, `ws-tls`, `kcp-noise`), `XrayFragment`/`XrayNoise`, full Foreign server & Iran `dokodemo-door` bridge JSON renderer, and `vless://` client URI builder.
+- **Ops Suite (`src/ops_suite.rs`)**: Sentinel health/port/eligibility, full kernel `DoctorReport` (`ip_forward`, `rp_filter`, BBR, `fq`, PMTU), `PerfConfig` sysctl BBR+FQ+buffer optimizer, and lock-free `InflightLimiter` hardening.
+
+### Phase 5: Customer Quotas, Rate Limits & Traffic Accounting
+- **Customers, Limits & Usage (`src/customers.rs`)**: Multi-engine customer registry (`customers.json`, `hsell-{cid}-{lid}`), expiry & quota enforcement, `LimitRule` (`daily`/`weekly`/`monthly` resets), idempotent `nftables` counter/drop tables, `tc` HTB bandwidth policing, and wrap-safe `UsageStore` (`traffic_peers.json`).
+
+### Phase 6: Compact Harsh-Network Micro-NLP & 200/300 Concurrent-User Netem A/B Suite
+- **Micro-NLP Controller (`src/harsh_nlp.rs`)**: Zero-dependency fixed-weight classifier fusing telemetry (`rtt`, `jitter`, `loss`, `retransmit`, `disconnects`, `big_pkt_drop`) + log cues into 6 harsh regimes (`Clean`, `Congested`, `LossyBurst`, `MtuBlackhole`, `DpiReset`, `SevereThrottling`), emitting concrete tuning (`carrier`, `chunk_bytes`, `pacing_kbps`, `fec_parity_pct`, `mtu`), with **Shadow mode default**, **automatic rollback** on regression, and **180s cooldown lockout**.
+- **200/300 Stress & Netem A/B Harness (`scripts/stress_harsh_300_ab.sh`)**: Network-namespace + `tc netem` test rig (`good`/`bad`/`harsh` profiles at 200 & 300 concurrent clients) comparing Shadow vs Active Micro-NLP with tabular & JSON metrics (goodput, p50/p95/p99, success rate).
+
+## [0.19.0-phase1-phase2] - Khaymali Port Phases 1 & 2
+
+### Phase 1: Real Spoof Carrier, Live Cluster Mesh & Live Carrier Swap
+- **Spoof Carrier (`src/spoof_carrier.rs`)**: Full port of Khaymali `spoof.go` & `spoof_tester.go`, including `spoof.json` persistence, reserved port protection, idempotent `forward.nft` with bidirectional MSS clamping, UFW hooks, WireGuard handshake freshness check, Khaymali `spf1_` bundles (plus backward-compatible `SPOOF1:`), pure-Rust constant-time X25519 pubkey derivation (RFC 7748 verified), and native `RawSpoofEngine` over `socket2` (`IP_HDRINCL`, RFC 1071 checksums) for UDP/TCP/ICMP spoofing.
+- **Cluster Mesh (`src/cluster_mesh.rs`)**: Real Tokio HTTP/1.1 mesh server & client on `/_hc/hello`, `/_hc/beat`, `/_hc/adopt` with Khaymali `X-Khaymali-Ts`/`Nonce`/`Sig` HMAC-SHA256 headers, stealth `404` on invalid/replayed requests, pure-Rust AES-256-GCM `sync_seal`/`sync_open` (verified against OpenSSL), `hc1_` join codes, transitive `mesh_meet`, graceful `bye`, EWMA link bps tracker, and 3s heartbeat loop feeding DNS writer election.
+- **Live Carrier Swap (`src/carrier_swap.rs`)**: `CarrierChoice` parser, atomic file+unit `UnitSwitchTx` with full rollback, 4-phase Iran<->Foreign `execute_live_swap` coordinator (`foreign -> local -> verify -> automatic revert`), `ForeignSwapAgent` HTTP endpoints (`/api/peer/swap-carrier`, `/api/peer/swap-status`), state persistence (`carrier_swap.json`, `tunnel_links.json`), and manual bundle fallback.
+
+### Phase 2: FRP & Backhaul Engine Managers, Setup Bundles & Auto Pool
+- **Setup Bundles (`src/setup_bundle.rs`)**: Full `hsh1_`, `bh1_`, and `gh1_` encode/parse/apply (`+udp<port>` companion, `fou<p1>-<p2>`, `tr-<transport>`), port range & mapping parser (`443, 8080-8090, 2083=8443`), `rewrite_frpc_toml_ports` carrying over per-proxy options, and UFW `ufw.opened` tracking.
+- **Engine Managers & Setup (`src/engines.rs`)**: FRP (`frps`/`frpc` TOML for `tcp`/`kcp`/`quic`/`websocket` + PROXY protocol v1/v2, bandwidth cap, TCP health checks), Backhaul (`backhaul-server`/`backhaul-client` TOML for all 7 transports, flat+sectioned TOML parser, live `connection_pool` 1..64 tuning, `backhaul-udp-*` companion), transactional Iran/Foreign setup planner, and `auto_pool_for_clash` / `undo_auto_pools`.
+
 # Changelog
 
 All notable changes to Khaymali Tunnel are documented here. Historical version changelogs and audits (`v0.5.0` through `v0.14.0`) are preserved in [`docs/archive/`](docs/archive/).
+
+## [0.18.0] - Complete Khaymali Tunneling Suite Port
+
+### Added
+- `src/ws_transport.rs`: Pure-Rust RFC 6455 WebSocket (`ws://`) & WSS-over-Camo TLS (`wss://`) carriers with HMAC-SHA256 `X-Khaymali-Auth`, Ping/Pong keepalive, Decoy fallback on WSS, and Exit listeners (`--ws-listen`, `--wss-listen`).
+- `src/ssh_carrier.rs`: Bagher SSH tunnel carrier (`ssh://[user@]host[:ssh_port][/remote_port]`) solving OpenSSH `ssh -N` Nagle latency via session-exec `TCP_NODELAY` nudge, IPv6 bracketed `known_hosts`, and multi-link port conflict detection.
+- `src/spoof_carrier.rs`: Spoof IP-spoofing pipe + WireGuard overlay carrier (`spoof://10.20.0.2:443`), `spoof-core` JSON, `wg-spoof.conf` (MTU 1280), nftables forwarding rules, and `SPOOF1:` setup bundles (`khaymali spoof gen|parse`).
+- `src/l3_wraps.rs`: All 4 Khaymali GRE wraps (`direct` proto 47, `wss`, `6to4` SIT proto 41 + `ip6gre`, `4in6` public IPv6 `ip6gre`), persistent `PathMtuKeeper` (`1380 -> 1360 -> 1340 -> 1300 -> 1280` + TCP MSS clamp), collision-free `/30` `GrePairAllocator`, and `CarrierAdvisor` (`khaymali carrier wrap|mtu|pair|swap`).
+- `src/dial_route.rs`: Smart Dial Route (`auto | gre | public`) with automatic GRE->Public fallback, 5 consecutive healthy GRE checks to return, and 30-minute failback lock (`khaymali dial status|set`).
+- `src/pathtest.rs`: End-to-end multi-carrier PathTest & Benchmark (`khaymali pathtest serve|run <pt1_CODE>`) testing TCP, UDP, Camo, WS, WSS, UDP+FEC, Ktunnel, TCP over IPv6, and SSH with RTT, Jitter, Loss, Mbps, and 0-100 Khaymali quality scoring.
+- `src/revpath.rs`: 6-layer Reverse-Path Doctor & safe Auto-Fix (`khaymali revpath check|fix`) classifying all 11 Khaymali verdicts (`HEALTHY`, `RP_FILTER`, `SRC_SELECT`, `NO_RETURN_ROUTE`, `FW_INPUT`, `MTU_BLACKHOLE`, `CONNTRACK_INVALID`, `ISP_ICMP_ONE_WAY`, `ISP_GRE_BLOCK`, `CLOUD_SG`, `UNKNOWN`).
+- `src/cluster_mesh.rs`: Iran-to-Iran Hub Mesh HMAC-SHA256 signed heartbeats with anti-replay nonce cache, emergency DNAT+MASQUERADE hub-forward rules (`khaymali mesh hub-fwd`), deterministic single DNS Writer election, `A`/`AAAA` failover & balance records, and Cloudflare `curl -K -` config generation.
+- `src/rescue.rs`: Passive one-way block detector (`khaymali rescue check`) and loopback Tunnel Egress SOCKS5 Bridge (`--egress-bridge` / `khaymali rescue egress`) restricted to `api.telegram.org:443` and `api.cloudflare.com:443` with `--alert-proxy` integration.
+- `src/watchdog.rs`: Upgraded with 3-Layer Tunnel Health (`service + session + data probe` -> `PASS | FAIL | UNREACHABLE`, `khaymali health`) and Per-Exit exponential backoff watchdog (`3m -> 6m -> 12m -> 30m`).
+- Extended `src/transport.rs`, `src/transport_engine.rs`, `src/autopilot.rs`, `src/control.rs`, `src/entry.rs`, `src/exit.rs`, `src/bridge.rs`, `src/stats.rs`, `src/main.rs` with full scheme routing and zero extra crate dependencies.
+
+## [0.17.0] - Multi-Exit pool, Autopilot, alerts
+
+### Added
+- `src/pool.rs`: multi-Exit pool policy. `--pool-mode failover|balance|sticky|latency|least`, `--failback auto|manual`, per-exit options `;w=N;p=N;max=N;standby;drain`. Live control: `khaymali pool status|drain|undrain|failback`. Without these flags behaviour is unchanged.
+- `src/autopilot.rs`: `--autopilot` (`--ap-down`, `--ap-cooldown`, `--ap-per-day`, `--ap-no-path-test`, `--ap-quiet FROM-TO`, `--ap-carriers`, `--ap-state`). A tunnel down for N minutes is path-tested over every allowed carrier, moved to the fastest one, verified for 45 s and rolled back on failure; failed carriers go last for 6 h; max 3 carriers per run. History: `khaymali autopilot`.
+- `src/alerts.rs`: `--alert-webhook URL`, `--alert-telegram BOT_TOKEN:CHAT_ID` (down / recovered / switched). Alone, they run Autopilot in monitor-only mode.
+- `Exits::force`, live-link counting per Exit (`Link::with_guard`), control RPCs `pool.status|drain|undrain|failback`.
+- Tests: 17 unit tests, `tests/pool_e2e.sh`, `tests/autopilot_e2e.sh`.
+
+### Notes
+- Autopilot needs one `--exit` per carrier (tcp, `udp://`, `ktunnel://`) and an Exit listening on each.
+- `sticky` has no client identity at link-dial level yet.
+- Quiet hours use `KHAYMALI_TZ_OFFSET_MIN` (e.g. 210 for Iran).
 
 ## [0.16.0] - One-command setup, clock guard, live dashboard
 

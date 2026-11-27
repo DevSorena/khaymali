@@ -6,6 +6,7 @@
 //! concurrency cap, jittered backoff). Never weakens authentication, camouflage, SSRF policy,
 //! or replay protection.
 
+use crate::harsh_nlp::{HarshNlpController, MicroNlpDecision, PolicyMode, TelemetrySnapshot};
 use crate::kani_nlp::{DiagnosticAction, LinkMetrics, NetIntent, NlpAdvisor};
 use crate::intelligence::{IntelligenceReport, NetworkIntelligence, NetworkMode, NetworkSample, PathRanking};
 use crate::stats;
@@ -282,6 +283,9 @@ struct DetectorState {
     path_telemetry: HashMap<String, PathRuntimeTelemetry>,
     /// v0.15.1: safety envelope around NLP-applied knob changes.
     nlp_guard: NlpActionGuard,
+    /// v0.22.0: compact fixed-weight Harsh-Network Micro-NLP controller.
+    harsh_nlp: HarshNlpController,
+    last_harsh_decision: Option<MicroNlpDecision>,
 }
 
 /// v0.15.1 NLP action safety envelope.
@@ -424,6 +428,8 @@ impl AdaptiveRuntime {
                 ewma_jitter_ms: 0.0,
                 path_telemetry: HashMap::with_capacity(8),
                 nlp_guard: NlpActionGuard::default(),
+                harsh_nlp: HarshNlpController::new(PolicyMode::parse(nlp_mode())),
+                last_harsh_decision: None,
             }),
         })
     }
@@ -468,6 +474,31 @@ impl AdaptiveRuntime {
     /// No probability is exposed until this operation succeeds.
     pub fn fit_risk_calibrator(&self, examples: &[crate::intelligence::CalibrationExample]) -> bool {
         self.state.lock().unwrap().intelligence.fit_calibrator(examples)
+    }
+
+    pub fn set_harsh_nlp_mode(&self, mode: PolicyMode) {
+        if let Ok(mut st) = self.state.lock() {
+            st.harsh_nlp.mode = mode;
+        }
+    }
+
+    pub fn harsh_nlp_status_json(&self) -> String {
+        let Ok(st) = self.state.lock() else {
+            return "{\"ok\":false,\"error\":\"lock_poisoned\"}\n".to_string();
+        };
+        let now_ts = crate::util::now_unix();
+        let mut obj = crate::hjson::Json::obj()
+            .set("ok", true)
+            .set("mode", st.harsh_nlp.mode.as_str())
+            .set("locked", st.harsh_nlp.is_locked(now_ts))
+            .set("rollbacks", st.harsh_nlp.rollbacks)
+            .set("current", st.harsh_nlp.current.to_json());
+        if let Some(ref dec) = st.last_harsh_decision {
+            obj.insert("last_decision", dec.to_json());
+        }
+        let mut out = obj.to_string_compact();
+        out.push('\n');
+        out
     }
 
     pub fn reload_nlp_model(&self) -> bool {
@@ -809,6 +840,42 @@ impl AdaptiveRuntime {
                 stats::INTELLIGENCE_CALIBRATION_SAMPLES.store(st.intelligence.calibration_samples() as u64, Relaxed);
             }
             if nlp_mode != "off" {
+            // Feed live telemetry into the compact Harsh-Network Micro-NLP controller
+            {
+                let big_drop = if large_stalls >= 2 && small_oks >= 1 {
+                    0.85
+                } else if large_stalls >= 1 {
+                    0.45
+                } else {
+                    0.0
+                };
+                let hsnap = TelemetrySnapshot {
+                    ts_unix: crate::util::now_unix(),
+                    rtt_ms: st.latest_rtt_ms as f32,
+                    base_rtt_ms: st.baseline_rtt_ms.max(10) as f32,
+                    jitter_ms: st.ewma_jitter_ms as f32,
+                    loss_pct: (loss_pm as f32) / 10.0,
+                    retransmit_pct: udp_loss_pct as f32,
+                    disconnects_per_min: resets + connect_failures,
+                    big_pkt_drop_ratio: big_drop,
+                    goodput_kbps: st.ewma_goodput_kbps as f32,
+                    recent_log: log.unwrap_or("").to_string(),
+                };
+                let _ = st.harsh_nlp.verify_or_rollback(&hsnap);
+                let hdec = st.harsh_nlp.evaluate(&hsnap);
+                if hdec.applied {
+                    let next_chunk = (hdec.recommended.chunk_bytes as usize).clamp(CHUNK_SURVIVAL, CHUNK_NORMAL);
+                    self.chunk_bytes.store(next_chunk, Relaxed);
+                    stats::ADAPTIVE_CHUNK_BYTES.store(next_chunk, Relaxed);
+                    let next_pacing_us = if hdec.recommended.pacing_kbps > 0 {
+                        ((next_chunk as u64 * 8 * 1000) / (hdec.recommended.pacing_kbps as u64).max(1)).min(2_500)
+                    } else {
+                        0
+                    };
+                    self.pacing_us.store(next_pacing_us, Relaxed);
+                }
+                st.last_harsh_decision = Some(hdec);
+            }
             // Publish the same numeric snapshot consumed by classify_combined so replay
             // datasets can carry genuine LinkMetrics rather than unrelated Prometheus counters.
             stats::NLP_LINK_LOSS_PER_MILLE.store(loss_pm as u64, Relaxed);

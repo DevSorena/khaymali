@@ -22,7 +22,12 @@ pub enum CarrierKind {
     QuicStream,
     KcpFec,
     WsH2,
+    WssCamo,
     Ktunnel,
+    SshBagher,
+    SpoofWg,
+    Gre6to4,
+    Gre4in6,
 }
 
 impl CarrierKind {
@@ -34,7 +39,12 @@ impl CarrierKind {
             CarrierKind::QuicStream => "quic-stream",
             CarrierKind::KcpFec => "kcp-fec",
             CarrierKind::WsH2 => "ws-h2",
+            CarrierKind::WssCamo => "wss",
             CarrierKind::Ktunnel => "ktunnel",
+            CarrierKind::SshBagher => "ssh-bagher",
+            CarrierKind::SpoofWg => "spoof-wg",
+            CarrierKind::Gre6to4 => "gre-6to4",
+            CarrierKind::Gre4in6 => "gre-4in6",
         }
     }
 
@@ -46,7 +56,12 @@ impl CarrierKind {
             "quic-stream" | "quic" => Some(CarrierKind::QuicStream),
             "kcp-fec" | "kcp" => Some(CarrierKind::KcpFec),
             "ws-h2" | "ws" | "h2" => Some(CarrierKind::WsH2),
+            "wss" | "wss+camo" => Some(CarrierKind::WssCamo),
             "ktunnel" | "k_tcpmux" => Some(CarrierKind::Ktunnel),
+            "ssh" | "ssh-bagher" | "bagher" => Some(CarrierKind::SshBagher),
+            "spoof" | "spoof-wg" => Some(CarrierKind::SpoofWg),
+            "6to4" | "gre-6to4" => Some(CarrierKind::Gre6to4),
+            "4in6" | "gre-4in6" => Some(CarrierKind::Gre4in6),
             _ => None,
         }
     }
@@ -154,7 +169,12 @@ impl TransportRegistry {
             (CarrierKind::QuicStream, true, true, false, 1200),
             (CarrierKind::KcpFec, true, true, true, 1200),
             (CarrierKind::WsH2, true, false, false, 14000),
+            (CarrierKind::WssCamo, true, false, false, 1360),
             (CarrierKind::Ktunnel, true, true, false, 14336),
+            (CarrierKind::SshBagher, true, false, false, 14336),
+            (CarrierKind::SpoofWg, false, false, false, 1280),
+            (CarrierKind::Gre6to4, false, false, false, 1380),
+            (CarrierKind::Gre4in6, false, false, false, 1380),
         ] {
             map.insert(
                 kind,

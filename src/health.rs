@@ -119,6 +119,26 @@ struct Inner {
 
 pub struct Exits {
     inner: Mutex<Inner>,
+    policy: Mutex<crate::pool::PoolPolicy>,
+    inflight: Arc<Mutex<std::collections::HashMap<String, u32>>>,
+    last_served: Mutex<Option<String>>,
+    forced: Mutex<Option<String>>,
+}
+
+/// Counts one live link against an Exit; dropping it (link closed) releases the count.
+pub struct ExitSlot {
+    map: Arc<Mutex<std::collections::HashMap<String, u32>>>,
+    addr: String,
+}
+
+impl Drop for ExitSlot {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.map.lock() {
+            if let Some(n) = m.get_mut(&self.addr) {
+                *n = n.saturating_sub(1);
+            }
+        }
+    }
 }
 
 impl Exits {
@@ -157,7 +177,64 @@ impl Exits {
                 hysteresis_interval: interval,
                 history: VecDeque::with_capacity(HISTORY_CAP),
             }),
+            policy: Mutex::new(crate::pool::PoolPolicy::default()),
+            inflight: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            last_served: Mutex::new(None),
+            forced: Mutex::new(None),
         })
+    }
+
+    /// Autopilot override: send every new link to `addr` (when selectable) until cleared.
+    pub fn force(&self, addr: Option<String>) {
+        *self.forced.lock().unwrap() = addr;
+    }
+
+    pub fn forced(&self) -> Option<String> {
+        self.forced.lock().unwrap().clone()
+    }
+
+    pub fn set_policy(&self, p: crate::pool::PoolPolicy) {
+        *self.policy.lock().unwrap() = p;
+    }
+
+    /// Count one live link on `addr` until the returned guard is dropped.
+    pub fn slot(&self, addr: &str) -> ExitSlot {
+        *self.inflight.lock().unwrap().entry(addr.to_string()).or_insert(0) += 1;
+        ExitSlot { map: self.inflight.clone(), addr: addr.to_string() }
+    }
+
+    pub fn set_drain(&self, addr: &str, drain: bool) -> bool {
+        self.policy.lock().unwrap().set_drain(addr, drain)
+    }
+
+    /// Operator "fail back now": forget the backup that kept serving under `--failback manual`.
+    pub fn fail_back_now(&self) {
+        *self.last_served.lock().unwrap() = None;
+    }
+
+    /// One line of JSON per member for `pool.status`.
+    pub fn pool_status_json(&self) -> String {
+        let pol = self.policy.lock().unwrap().clone();
+        let inflight = self.inflight.lock().unwrap().clone();
+        let cur = self.last_served.lock().unwrap().clone();
+        let snaps = self.snapshot();
+        let members: Vec<String> = snaps
+            .iter()
+            .map(|s| {
+                let o = pol.opts_for(&s.addr);
+                format!(
+                    "{{\"addr\":\"{}\",\"up\":{},\"selectable\":{},\"rtt_ms\":{:.1},\"links\":{},\"weight\":{},\"priority\":{},\"standby\":{},\"max\":{},\"drain\":{},\"serving\":{}}}",
+                    s.addr.replace('"', ""), s.up, s.selectable, s.ewma_ms,
+                    inflight.get(&s.addr).copied().unwrap_or(0),
+                    o.weight, o.priority, o.standby, o.max_conn, o.drain,
+                    cur.as_deref() == Some(s.addr.as_str())
+                )
+            })
+            .collect();
+        format!(
+            "{{\"ok\":true,\"mode\":\"{}\",\"manual_failback\":{},\"policy\":{},\"members\":[{}]}}\n",
+            pol.mode.as_str(), pol.manual_failback, pol.enabled, members.join(",")
+        )
     }
 
     fn score(s: &St) -> f64 {
@@ -318,6 +395,45 @@ impl Exits {
         // eligibility is granted by try_select() and remains single-flight per exit.
         if selectable.is_empty() {
             return None;
+        }
+
+        if let Some(f) = self.forced.lock().unwrap().clone() {
+            if let Some(&i) = selectable.iter().find(|&&i| g.exits[i].addr == f) {
+                if g.exits[i].circuit == CircuitState::HalfOpen {
+                    g.exits[i].half_open_probe_sent = true;
+                }
+                return Some(f);
+            }
+        }
+
+        {
+            let pol = self.policy.lock().unwrap().clone();
+            if pol.enabled {
+                let infl = self.inflight.lock().unwrap().clone();
+                let cur = self.last_served.lock().unwrap().clone();
+                let cands: Vec<crate::pool::Cand<'_>> = selectable
+                    .iter()
+                    .map(|&i| crate::pool::Cand {
+                        addr: g.exits[i].addr.as_str(),
+                        ewma_ms: g.exits[i].ewma_ms,
+                        inflight: infl.get(&g.exits[i].addr).copied().unwrap_or(0),
+                    })
+                    .collect();
+                let rnd = u64::from_be_bytes(crate::util::rand_bytes::<8>());
+                let key = rnd; // dial-level picks have no client identity
+                let chosen = pol.choose(&cands, key, rnd, cur.as_deref()).map(|ci| selectable[ci]);
+                return match chosen {
+                    Some(idx) => {
+                        if g.exits[idx].circuit == CircuitState::HalfOpen {
+                            g.exits[idx].half_open_probe_sent = true;
+                        }
+                        let a = g.exits[idx].addr.clone();
+                        *self.last_served.lock().unwrap() = Some(a.clone());
+                        Some(a)
+                    }
+                    None => None,
+                };
+            }
         }
 
         if selectable.len() > 1 && rand_range(0, 99) < 15 {

@@ -12,7 +12,10 @@
 use crate::camo::{self, CamoCfg};
 use crate::ktunnel;
 use crate::link;
+use crate::spoof_carrier;
+use crate::ssh_carrier;
 use crate::udp_transport;
+use crate::ws_transport;
 use crate::util::{ct_eq, BoxRw};
 use anyhow::{bail, Result};
 use hmac::{Hmac, Mac};
@@ -159,6 +162,72 @@ impl Transport for KtunnelTransport {
     }
 }
 
+pub fn needs_multi_transport(exits: &[String]) -> bool {
+    exits.iter().any(|e| {
+        e.starts_with("udp://")
+            || e.starts_with("ktunnel://")
+            || e.starts_with("auto://")
+            || e.starts_with("ws://")
+            || e.starts_with("wss://")
+            || e.starts_with("ssh://")
+            || e.starts_with("spoof://")
+    })
+}
+
+pub fn requires_carrier_secret(exits: &[String]) -> bool {
+    exits.iter().any(|e| {
+        e.starts_with("udp://")
+            || e.starts_with("ktunnel://")
+            || e.starts_with("wss://")
+    })
+}
+
+pub struct WsTransport {
+    pub auth_key: Vec<u8>,
+    pub connect_timeout: Duration,
+}
+
+impl Transport for WsTransport {
+    fn name(&self) -> &'static str { "ws" }
+    fn dial<'a>(&'a self, addr: &'a str) -> Pin<Box<dyn Future<Output = Result<BoxRw>> + Send + 'a>> {
+        Box::pin(async move { ws_transport::connect_ws(addr, &self.auth_key, self.connect_timeout).await })
+    }
+}
+
+pub struct WssTransport {
+    pub cfg: CamoCfg,
+    pub connect_timeout: Duration,
+}
+
+impl Transport for WssTransport {
+    fn name(&self) -> &'static str { "wss" }
+    fn dial<'a>(&'a self, addr: &'a str) -> Pin<Box<dyn Future<Output = Result<BoxRw>> + Send + 'a>> {
+        Box::pin(async move { ws_transport::connect_wss(addr, &self.cfg, self.connect_timeout).await })
+    }
+}
+
+pub struct SshTransport {
+    pub connect_timeout: Duration,
+}
+
+impl Transport for SshTransport {
+    fn name(&self) -> &'static str { "ssh+bagher" }
+    fn dial<'a>(&'a self, addr: &'a str) -> Pin<Box<dyn Future<Output = Result<BoxRw>> + Send + 'a>> {
+        Box::pin(async move { ssh_carrier::connect_ssh(addr, self.connect_timeout).await })
+    }
+}
+
+pub struct SpoofTransport {
+    pub connect_timeout: Duration,
+}
+
+impl Transport for SpoofTransport {
+    fn name(&self) -> &'static str { "spoof+wg" }
+    fn dial<'a>(&'a self, addr: &'a str) -> Pin<Box<dyn Future<Output = Result<BoxRw>> + Send + 'a>> {
+        Box::pin(async move { spoof_carrier::connect_spoof(addr, self.connect_timeout).await })
+    }
+}
+
 pub struct AutoTransport {
     pub camo: Option<CamoCfg>,
     pub udp_auth_key: Vec<u8>,
@@ -168,16 +237,16 @@ pub struct AutoTransport {
 impl Transport for AutoTransport {
     fn name(&self) -> &'static str {
         if self.camo.is_some() {
-            "auto(udp+fec/ktunnel/camo/tcp)"
+            "auto(udp+fec/ktunnel/wss/ws/camo/ssh/spoof/tcp)"
         } else {
-            "auto(udp+fec/ktunnel/tcp)"
+            "auto(udp+fec/ktunnel/ws/ssh/spoof/tcp)"
         }
     }
 
     fn dial<'a>(&'a self, addr: &'a str) -> Pin<Box<dyn Future<Output = Result<BoxRw>> + Send + 'a>> {
         Box::pin(async move {
             if let Some(auto_addr) = addr.strip_prefix("auto://") {
-                let stage_timeout = (self.connect_timeout / 3).max(Duration::from_secs(2));
+                let stage_timeout = (self.connect_timeout / 4).max(Duration::from_secs(2));
                 if !self.udp_auth_key.is_empty() {
                     if let Ok(s) = udp_transport::connect(auto_addr, &self.udp_auth_key, stage_timeout).await {
                         return Ok(s);
@@ -193,12 +262,33 @@ impl Transport for AutoTransport {
                         return Ok(s);
                     }
                 }
+                if let Some(cfg) = &self.camo {
+                    if let Ok(s) = ws_transport::connect_wss(auto_addr, cfg, stage_timeout).await {
+                        return Ok(s);
+                    }
+                }
                 let tcp = timeout(stage_timeout, TcpStream::connect(auto_addr)).await??;
                 link::tune(&tcp);
                 return match &self.camo {
                     Some(cfg) => camo::client(tcp, cfg).await,
                     None => Ok(Box::new(tcp) as BoxRw),
                 };
+            }
+            if addr.starts_with("wss://") {
+                let cfg = self
+                    .camo
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("wss:// requires --camo-secret and --camo-sni"))?;
+                return ws_transport::connect_wss(addr, cfg, self.connect_timeout).await;
+            }
+            if addr.starts_with("ws://") {
+                return ws_transport::connect_ws(addr, &self.udp_auth_key, self.connect_timeout).await;
+            }
+            if addr.starts_with("ssh://") {
+                return ssh_carrier::connect_ssh(addr, self.connect_timeout).await;
+            }
+            if addr.starts_with("spoof://") {
+                return spoof_carrier::connect_spoof(addr, self.connect_timeout).await;
             }
             if let Some(ktun_addr) = addr.strip_prefix("ktunnel://") {
                 return ktunnel::connect(ktun_addr, &self.udp_auth_key, ktunnel::DEFAULT_KTUN_FLOWS, self.connect_timeout).await;

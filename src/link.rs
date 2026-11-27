@@ -147,6 +147,7 @@ pub struct LinkReader {
     n: u64,
     frame_buf: Vec<u8>,
     _permit: Option<Arc<OwnedSemaphorePermit>>,
+    _guard: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 pub struct LinkWriter {
@@ -233,6 +234,7 @@ impl Link {
                 n: 0,
                 frame_buf: vec![0u8; CHUNK + TAG],
                 _permit: None,
+                _guard: None,
             },
             wr: LinkWriter {
                 s: w,
@@ -244,6 +246,12 @@ impl Link {
             last_checked: now,
             peer_pub,
         }
+    }
+
+    /// Keep `g` alive exactly as long as this link lives (used for per-Exit live-link counts).
+    pub fn with_guard<T: Send + Sync + 'static>(mut self, g: T) -> Self {
+        self.rd._guard = Some(Arc::new(g));
+        self
     }
 
     pub fn with_permit(mut self, permit: OwnedSemaphorePermit) -> Self {

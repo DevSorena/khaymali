@@ -17,6 +17,7 @@ use crate::transport::{AutoTransport, CamoTransport, TcpTransport, Transport};
 use crate::udp_transport::UdpCarrierListener;
 use crate::util::*;
 use crate::watchdog;
+use crate::ws_transport::WsCarrierListener;
 use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -36,6 +37,8 @@ pub struct ExitCfg {
     pub listen: String,
     pub udp_listen: Option<String>,
     pub ktunnel_listen: Option<String>,
+    pub ws_listen: Option<String>,
+    pub wss_listen: Option<String>,
     pub key: Vec<u8>,
     pub allowed: Vec<Vec<u8>>,
     pub allow_private: bool,
@@ -100,12 +103,14 @@ pub async fn run(cfg: ExitCfg) -> Result<()> {
         (false, false) => "tcp",
     };
     eprintln!(
-        "[exit] listening on {} ({} allowed entry key(s), max_conns={}, camouflage {}, udp={}, tun={})",
+        "[exit] listening on {} ({} allowed entry key(s), max_conns={}, camouflage {}, udp={}, ws={}, wss={}, tun={})",
         cfg.listen,
         cfg.allowed.len(),
         MAX_EXIT_CONNS,
         if cfg.camo.is_some() { "ON" } else { "off" },
         cfg.udp_listen.as_deref().unwrap_or("off"),
+        cfg.ws_listen.as_deref().unwrap_or("off"),
+        cfg.wss_listen.as_deref().unwrap_or("off"),
         cfg.tun.as_deref().unwrap_or("off"),
     );
 
@@ -138,9 +143,7 @@ pub async fn run(cfg: ExitCfg) -> Result<()> {
 
     if let Some(rev_entry) = cfg.reverse_entry.clone() {
         let workers = cfg.reverse_pool.clamp(1, 32);
-        let has_special = rev_entry.starts_with("udp://")
-            || rev_entry.starts_with("ktunnel://")
-            || rev_entry.starts_with("auto://");
+        let has_special = crate::transport::needs_multi_transport(std::slice::from_ref(&rev_entry));
         let tx_impl: Arc<dyn Transport> = if has_special {
             let auth_key = cfg
                 .camo
@@ -234,6 +237,73 @@ pub async fn run(cfg: ExitCfg) -> Result<()> {
                             let _permit = permit;
                             if let Err(e) = handle_stream(stream, &cfg_c, &pq_c, &sr_c).await {
                                 stats::log_err_rl(&format!("[exit] ktunnel {peer}: {e}"));
+                            }
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    if let Some(ws_addr) = cfg.ws_listen.clone() {
+        let ws_key = cfg.camo.as_ref().map(|c| c.secret.clone()).unwrap_or_default();
+        let wl = Arc::new(WsCarrierListener::bind(&ws_addr, ws_key, None).await?);
+        eprintln!("[exit] WS (RFC 6455) carrier listening on {ws_addr}");
+        let (cfg_w, conn_sem_w, peer_quota_w, ctl_w, sreg_w) = (
+            cfg.clone(), conn_sem.clone(), peer_quota.clone(), ctl.clone(), session_reg.clone(),
+        );
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = ctl_w.drain_notify.notified() => break,
+                    res = wl.accept() => {
+                        let Ok((tcp, peer)) = res else { continue };
+                        let Ok(permit) = conn_sem_w.clone().try_acquire_owned() else { drop(tcp); continue; };
+                        let (wl_c, cfg_c, pq_c, sr_c) = (wl.clone(), cfg_w.clone(), peer_quota_w.clone(), sreg_w.clone());
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            match wl_c.handshake(tcp, peer.ip()).await {
+                                Ok(Some(stream)) => {
+                                    if let Err(e) = handle_stream(stream, &cfg_c, &pq_c, &sr_c).await {
+                                        stats::log_err_rl(&format!("[exit] ws {peer}: {e}"));
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => stats::log_err_rl(&format!("[exit] ws handshake {peer}: {e}")),
+                            }
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    if let Some(wss_addr) = cfg.wss_listen.clone() {
+        let camo_wss = cfg.camo.clone().ok_or_else(|| anyhow::anyhow!("--wss-listen requires --camo-secret"))?;
+        let wss_key = camo_wss.secret.clone();
+        let wl = Arc::new(WsCarrierListener::bind(&wss_addr, wss_key, Some(camo_wss)).await?);
+        eprintln!("[exit] WSS (Camo TLS + RFC 6455) carrier listening on {wss_addr}");
+        let (cfg_w, conn_sem_w, peer_quota_w, ctl_w, sreg_w) = (
+            cfg.clone(), conn_sem.clone(), peer_quota.clone(), ctl.clone(), session_reg.clone(),
+        );
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = ctl_w.drain_notify.notified() => break,
+                    res = wl.accept() => {
+                        let Ok((tcp, peer)) = res else { continue };
+                        let Ok(permit) = conn_sem_w.clone().try_acquire_owned() else { drop(tcp); continue; };
+                        let (wl_c, cfg_c, pq_c, sr_c) = (wl.clone(), cfg_w.clone(), peer_quota_w.clone(), sreg_w.clone());
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            match wl_c.handshake(tcp, peer.ip()).await {
+                                Ok(Some(stream)) => {
+                                    if let Err(e) = handle_stream(stream, &cfg_c, &pq_c, &sr_c).await {
+                                        stats::log_err_rl(&format!("[exit] wss {peer}: {e}"));
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => stats::log_err_rl(&format!("[exit] wss handshake {peer}: {e}")),
                             }
                         });
                     }

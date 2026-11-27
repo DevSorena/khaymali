@@ -215,6 +215,14 @@ pub struct EntryCfg {
     pub pool_max: usize,
     /// File that persists learned patterns across restarts.
     pub adapt_state: Option<String>,
+    /// Multi-Exit pool policy (`--pool-mode`, per-exit `;w= ;p= ;max= ;standby ;drain`).
+    pub pool_policy: crate::pool::PoolPolicy,
+    /// Autopilot limits (`--autopilot`); `monitor_only` when only alerts were asked for.
+    pub autopilot: Option<crate::autopilot::Limits>,
+    pub autopilot_state: Option<String>,
+    pub alerts: crate::alerts::AlertCfg,
+    pub egress_bridge: Option<String>,
+    pub dial_router: Option<Arc<crate::dial_route::DialRouter>>,
 }
 
 /// Pool of live multiplexed Noise carriers (each carrying up to 128 concurrent TCP streams
@@ -346,15 +354,16 @@ pub async fn run(cfg: EntryCfg) -> Result<()> {
     let dialers = if cfg.adapt && direct_mode { cfg.pool_max.max(base_pool) } else { base_pool };
     let pool = LinkPool::new(dialers);
     let exits = Exits::new(cfg.exits.clone());
+    exits.set_policy(cfg.pool_policy.clone());
     let fwd_reg = ForwardRegistry::new();
     let adaptive = AdaptiveRuntime::new(MAX_SOCKS_CONNS);
     let session_reg = Arc::new(SessionRegistry::new());
 
-    let has_udp_exit = cfg.exits.iter().any(|e| e.starts_with("udp://") || e.starts_with("ktunnel://") || e.starts_with("auto://"));
+    let has_multi_exit = transport::needs_multi_transport(&cfg.exits);
     let transport_name = if !cfg.exits.is_empty() {
-        match (has_udp_exit, cfg.camo.is_some(), cfg.mux) {
-            (true, _, true) => "udp+mux",
-            (true, _, false) => "udp+arq",
+        match (has_multi_exit, cfg.camo.is_some(), cfg.mux) {
+            (true, _, true) => "multi+mux",
+            (true, _, false) => "multi",
             (false, true, true) => "camo+mux",
             (false, true, false) => "tcp+camo",
             (false, false, true) => "tcp+mux",
@@ -373,12 +382,14 @@ pub async fn run(cfg: EntryCfg) -> Result<()> {
         None
     };
 
-    let ctl = ControlState::with_runtime(
+    let ctl = ControlState::with_khaymali_extensions(
         "entry",
         transport_name,
         Some(exits.clone()),
         Some(fwd_reg.clone()),
         Some(adaptive.clone()),
+        cfg.dial_router.clone(),
+        Some(cfg.socks.clone()),
         cfg.allowed_bridges.clone(),
     );
 
@@ -498,13 +509,21 @@ pub async fn run(cfg: EntryCfg) -> Result<()> {
         });
     }
 
+    if let Some(egress_bind) = cfg.egress_bridge.clone() {
+        let up_socks = cfg.socks.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::rescue::serve_egress_bridge(egress_bind, up_socks, vec![]).await {
+                eprintln!("[egress-bridge] stopped: {e}");
+            }
+        });
+    }
+
     let direct_dialer: Option<Arc<DirectDialer>> = if !cfg.exits.is_empty() {
-        let tx_impl: Arc<dyn Transport> = if has_udp_exit {
-            let udp_auth_key = cfg
-                .camo
-                .as_ref()
-                .map(|c| c.secret.clone())
-                .ok_or_else(|| anyhow::anyhow!("udp:// and ktunnel:// exits require --camo-secret"))?;
+        let tx_impl: Arc<dyn Transport> = if has_multi_exit {
+            if transport::requires_carrier_secret(&cfg.exits) && cfg.camo.is_none() {
+                bail!("udp://, ktunnel://, and wss:// exits require --camo-secret");
+            }
+            let udp_auth_key = cfg.camo.as_ref().map(|c| c.secret.clone()).unwrap_or_default();
             Arc::new(AutoTransport {
                 camo: cfg.camo.clone(),
                 udp_auth_key,
@@ -529,6 +548,31 @@ pub async fn run(cfg: EntryCfg) -> Result<()> {
             cfg.mux && cfg.session_resume
         );
         tokio::spawn(health::probe_loop(exits.clone(), Duration::from_secs(20)));
+        tokio::spawn(crate::watchdog::run_link_watchdog(
+            exits.clone(),
+            Duration::from_secs(60),
+            crate::alerts::Alerts::new(cfg.alerts.clone()),
+        ));
+        if let Some(lim) = cfg.autopilot.clone() {
+            let (txp, kcfg) = (tx_impl.clone(), cfg.clone());
+            let probe = move |addr: String| {
+                let (txp, kcfg) = (txp.clone(), kcfg.clone());
+                async move {
+                    let t0 = Instant::now();
+                    let s = timeout(Duration::from_secs(8), txp.dial(&addr)).await??;
+                    let l = timeout(Duration::from_secs(8), link::initiate(s, &kcfg.key, &kcfg.exit_pub)).await??;
+                    drop(l);
+                    Ok::<Duration, anyhow::Error>(t0.elapsed())
+                }
+            };
+            tokio::spawn(crate::autopilot::run(
+                exits.clone(),
+                lim,
+                cfg.autopilot_state.clone(),
+                crate::alerts::Alerts::new(cfg.alerts.clone()),
+                probe,
+            ));
+        }
         for idx in 0..dialers {
             let (cfg, pool, exits, tx_impl, adaptive, ctl, adapt) = (
                 cfg.clone(),
@@ -863,7 +907,7 @@ async fn dial_once(
                 exits.update_path_intel(&addr, score, obs);
             }
             adapt::record_global(Event::DialOk { rtt });
-            Ok(l)
+            Ok(l.with_guard(exits.slot(&addr)))
         }
         Err((e, stage)) => {
             let kind = Exits::classify_error(&e);

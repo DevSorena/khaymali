@@ -25,6 +25,8 @@ cargo test --locked --lib intelligence:: -- --nocapture
 cargo test --locked --lib kani_nlp:: -- --nocapture
 cargo test --locked --lib recovery:: -- --nocapture
 cargo test --locked --lib health:: -- --nocapture
+echo "--- v0.22.0 Khaymali pure tunneling suite & Micro-NLP unit tests ---"
+cargo test --locked --lib hjson:: sysrun:: spoof_carrier:: cluster_mesh:: carrier_swap:: setup_bundle:: engines:: cluster_lb:: node_cluster:: sshfwd:: xray_engine:: ops_suite:: harsh_nlp:: -- --nocapture
 
 echo "=== 3. Negative security tests (cargo test --locked --test neg_security) ==="
 cargo test --locked --test neg_security

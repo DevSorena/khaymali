@@ -4,6 +4,7 @@
 //! `recovery.status`, `kani.diagnose`) + `drain`.
 //! No RPC command may mutate keys, allowlists, or destination policy.
 
+use crate::dial_route::{DialMode, DialRouter};
 use crate::forward::ForwardRegistry;
 use crate::health::Exits;
 use crate::kani_nlp::TinyNetNlp;
@@ -22,6 +23,8 @@ pub struct ControlState {
     pub exits: Option<Arc<Exits>>,
     pub forwards: Option<Arc<ForwardRegistry>>,
     pub adaptive: Option<Arc<AdaptiveRuntime>>,
+    pub dial_router: Option<Arc<DialRouter>>,
+    pub socks_addr: Option<String>,
     pub peers: Arc<RwLock<Vec<Vec<u8>>>>,
     pub draining: Arc<AtomicBool>,
     pub drain_notify: Arc<Notify>,
@@ -56,6 +59,33 @@ impl ControlState {
             exits,
             forwards,
             adaptive,
+            dial_router: None,
+            socks_addr: None,
+            peers: Arc::new(RwLock::new(peers)),
+            draining: Arc::new(AtomicBool::new(false)),
+            drain_notify: Arc::new(Notify::new()),
+        })
+    }
+
+    pub fn with_khaymali_extensions(
+        role: &'static str,
+        transport: &'static str,
+        exits: Option<Arc<Exits>>,
+        forwards: Option<Arc<ForwardRegistry>>,
+        adaptive: Option<Arc<AdaptiveRuntime>>,
+        dial_router: Option<Arc<DialRouter>>,
+        socks_addr: Option<String>,
+        peers: Vec<Vec<u8>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            role,
+            transport,
+            started: Instant::now(),
+            exits,
+            forwards,
+            adaptive,
+            dial_router,
+            socks_addr,
             peers: Arc::new(RwLock::new(peers)),
             draining: Arc::new(AtomicBool::new(false)),
             drain_notify: Arc::new(Notify::new()),
@@ -418,6 +448,97 @@ mod unix_impl {
                     stats::L3_PACKETS_TX.load(Relaxed),
                     stats::L3_PACKETS_RX.load(Relaxed),
                 )
+            }
+            "pool.status" => match st.exits.as_ref() {
+                Some(e) => e.pool_status_json(),
+                None => "{\"ok\":false,\"error\":\"no_exits\"}\n".to_string(),
+            },
+            "pool.drain" | "pool.undrain" => {
+                let addr = extract_json_str(line, "addr").unwrap_or_default();
+                let on = method == "pool.drain";
+                match st.exits.as_ref() {
+                    Some(e) if e.set_drain(&addr, on) => format!("{{\"ok\":true,\"addr\":\"{}\",\"drain\":{}}}\n", addr.replace('"', ""), on),
+                    _ => "{\"ok\":false,\"error\":\"unknown_member (declare it with ;w= or --pool-mode)\"}\n".to_string(),
+                }
+            }
+            "pool.failback" => match st.exits.as_ref() {
+                Some(e) => {
+                    e.fail_back_now();
+                    "{\"ok\":true,\"failback\":true}\n".to_string()
+                }
+                None => "{\"ok\":false,\"error\":\"no_exits\"}\n".to_string(),
+            },
+            "carrier.swap" => {
+                let target = extract_json_str(line, "addr").unwrap_or_default();
+                match st.exits.as_ref() {
+                    Some(e) => {
+                        if target.is_empty() || target.eq_ignore_ascii_case("auto") {
+                            e.force(None);
+                            "{\"ok\":true,\"forced\":null}\n".to_string()
+                        } else {
+                            e.force(Some(target.clone()));
+                            format!("{{\"ok\":true,\"forced\":\"{}\"}}\n", esc_json(&target))
+                        }
+                    }
+                    None => "{\"ok\":false,\"error\":\"no_exits\"}\n".to_string(),
+                }
+            }
+            "carriers.summary" => {
+                format!(
+                    "{{\"ok\":true,\"ws_sessions\":{},\"wss_sessions\":{},\"ssh_sessions\":{},\"udp_sessions\":{},\"ktunnel_sessions\":{},\"reverse_exits\":{},\"watchdog_events\":{}}}\n",
+                    stats::WS_SESSIONS_ACTIVE.load(Relaxed),
+                    stats::WSS_SESSIONS_ACTIVE.load(Relaxed),
+                    stats::SSH_CARRIER_SESSIONS.load(Relaxed),
+                    stats::UDP_TRANSPORT_SESSIONS.load(Relaxed),
+                    stats::KTUNNEL_SESSIONS_ACTIVE.load(Relaxed),
+                    stats::REVERSE_EXITS_CONNECTED.load(Relaxed),
+                    stats::WATCHDOG_EVENTS.load(Relaxed),
+                )
+            }
+            "dial.status" => match st.dial_router.as_ref() {
+                Some(dr) => dr.status_json(),
+                None => "{\"ok\":false,\"error\":\"dial_router_not_configured\"}\n".to_string(),
+            },
+            "dial.set" => {
+                let mode_str = extract_json_str(line, "mode").unwrap_or_default();
+                match (st.dial_router.as_ref(), DialMode::parse(&mode_str)) {
+                    (Some(dr), Ok(m)) => {
+                        dr.set_mode(m);
+                        dr.status_json()
+                    }
+                    (None, _) => "{\"ok\":false,\"error\":\"dial_router_not_configured\"}\n".to_string(),
+                    (_, Err(e)) => format!("{{\"ok\":false,\"error\":\"{}\"}}\n", esc_json(&e.to_string())),
+                }
+            }
+            "health.three_layer" => match st.exits.as_ref() {
+                Some(e) => {
+                    let res = crate::watchdog::check_three_layer_live(e, st.socks_addr.as_deref()).await;
+                    format!(
+                        "{{\"ok\":true,\"verdict\":\"{}\",\"service\":{},\"session\":{},\"data\":{},\"rtt_ms\":{:.1},\"detail\":\"{}\"}}\n",
+                        res.verdict.as_str(),
+                        res.service_ok,
+                        res.session_ok,
+                        res.data_ok,
+                        res.data_rtt_ms,
+                        esc_json(&res.detail),
+                    )
+                }
+                None => "{\"ok\":false,\"error\":\"no_exits\"}\n".to_string(),
+            },
+            "harsh_nlp.status" => match st.adaptive.as_ref() {
+                Some(a) => a.harsh_nlp_status_json(),
+                None => "{\"ok\":false,\"error\":\"adaptive_disabled\"}\n".to_string(),
+            },
+            "harsh_nlp.mode" => {
+                let m = extract_json_str(line, "mode").unwrap_or_else(|| "shadow".into());
+                let parsed = crate::harsh_nlp::PolicyMode::parse(&m);
+                match st.adaptive.as_ref() {
+                    Some(a) => {
+                        a.set_harsh_nlp_mode(parsed);
+                        a.harsh_nlp_status_json()
+                    }
+                    None => "{\"ok\":false,\"error\":\"adaptive_disabled\"}\n".to_string(),
+                }
             }
             "drain" => {
                 st.trigger_drain();

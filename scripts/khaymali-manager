@@ -3,7 +3,7 @@
 # v0.16.0: one-command join, automatic key exchange, clock-skew guard (ktime),
 #          de-duplicated keys, case-insensitive input, multi-bridge, larger initial pool.
 set -uo pipefail
-VERSION_MGR="0.16.0"
+VERSION_MGR="0.21.0"
 REPO="${KHAYMALI_REPO:-DevSorena/khaymali}"
 BIN="${KHAYMALI_BINPATH:-${KHAYMALI_BIN:-/usr/local/bin/khaymali}}"
 ETC="${KHAYMALI_CONF:-/etc/khaymali}"
@@ -408,30 +408,179 @@ uninstall(){ [ "$(ask 'Type YES to remove all khaymali services and config')" = 
   backup; for r in exit entry bridge; do systemctl disable --now "khaymali-$r" 2>/dev/null; rm -f "$UNIT/khaymali-$r.service"; done
   rm -f /etc/cron.d/khaymali-ktime /usr/local/bin/ktime; rm -rf "$ETC"; systemctl daemon-reload; ok "removed (binary kept at $BIN, backup in $BK)"; }
 
+# ---------- advanced menu (v0.21.0) ----------
+c_c=$'\e[36m'; c_m=$'\e[35m'; c_d=$'\e[2m'; c_R=$'\e[1;31m'
+[ -t 1 ] || { c_c=; c_m=; c_d=; c_R=; }
+LINE="=================================================================="
+banner(){
+  echo "${c_R}"
+  cat <<'EOF'
+   _  __ _                                    _  _
+  | |/ /| |__    __ _  _   _  _ __ ___    __ _ | |(_)
+  | ' / | '_ \  / _` || | | || '_ ` _ \  / _` || || |
+  | . \ | | | || (_| || |_| || | | | | || (_| || || |
+  |_|\_\|_| |_| \__,_| \__, ||_| |_| |_| \__,_||_||_|
+                       |___/
+EOF
+  echo "${c_0}${c_d}  Khaymali manager v$VERSION_MGR  -  camouflaged multi-link tunnel${c_0}"
+  echo "${c_d}  github.com/$REPO${c_0}"
+}
+svc_badge(){ local st; st=$(systemctl is-active "khaymali-$1" 2>/dev/null)
+  case $st in active) echo "${c_g}[ON]${c_0}";; failed) echo "${c_r}[FAIL]${c_0}";; *) echo "${c_y}[OFF]${c_0}";; esac; }
+status_strip(){
+  local r line="" v; v=$("$BIN" version 2>/dev/null | head -1)
+  for r in exit entry bridge; do has_role $r && line+=" $r $(svc_badge $r) "; done
+  [ -z "$line" ] && line=" ${c_y}no role configured yet${c_0}"
+  echo "  ${c_b}binary:${c_0} ${v:-?}   ${c_b}host:${c_0} $(hostname 2>/dev/null)"
+  echo "  ${c_b}roles:${c_0}$line"
+  has_role entry && echo "  ${c_b}entry:${c_0} mode $(conf_get entry MODE)  exit $(conf_get entry EXIT)  socks $(conf_get entry SOCKS)"
+  has_role exit  && echo "  ${c_b}exit:${c_0}  listen $(conf_get exit LISTEN)  ip $(conf_get exit PUBLIC_IP)"
+}
+item(){ printf "  ${c_r}%4s)${c_0} ${c_b}%-22s${c_0} ${c_d}%s${c_0}\n" "$1" "$2" "$3"; }
+section(){ echo; echo "  ${c_m}${c_b}$*${c_0}"; }
+header(){ clear 2>/dev/null; banner; echo "${c_d}$LINE${c_0}"; status_strip; echo "${c_d}$LINE${c_0}"; [ -n "${1:-}" ] && echo "  ${c_c}${c_b}>> $1${c_0}"; }
+choice(){ local v; read -rp "$(printf '\n  %sEnter your choice%s %s: ' "$c_b" "$c_0" "${1:-}")" v; lc "$(trim "$v")"; }
+role_pick(){ local n; n=$(roles | wc -l); [ "$n" = 0 ] && { warn "set up a role first"; return 1; }
+  [ "$n" = 1 ] && { roles; return; }; lc "$(ask "Role ($(roles | xargs))" "$(roles | head -1)")"; }
+
+menu_setup(){ while true; do header "Setup"
+  section "Install a role on THIS server"
+  item 1 "Setup EXIT"     "abroad server, creates the join code"
+  item 2 "Setup ENTRY"    "Iran server, paste the join code"
+  item 3 "Setup BRIDGE"   "Iran server WITH international access"
+  item 4 "Show join code" "print the one-line Iran command again"
+  item 5 "Push to Iran"   "copy + install over SSH (GitHub blocked)"
+  item 0 "Back"           ""
+  case $(choice "[0-5]") in 1) setup_exit;; 2) setup_entry;; 3) setup_bridge;; 4) show_join;; 5) push_to "";; 0|b|"") return;; *) warn "unknown choice";; esac; pause; done; }
+
+menu_manage(){ while true; do header "Manage"
+  section "Service"
+  item 1 "Status"            "links, traffic, rtt, loss, nlp, exit ip"
+  item 2 "Live dashboard"    "TUI, real-time graphs"
+  item 3 "Logs"              "last 60 lines"
+  item 4 "Follow logs"       "live journal (Ctrl+C to stop)"
+  item 5 "Start"             "start service"
+  item 6 "Restart"           "restart service"
+  item 7 "Stop"              "stop service"
+  section "Configuration"
+  item 8 "Keys / join code"  "allowed keys, add/delete, new bridge"
+  item 9 "Port forwards"     "443 | 2053/udp | 8080=80 | ranges"
+  item 10 "Edit config"      "opens editor, auto-rollback on failure"
+  item 0 "Back"              ""
+  case $(choice "[0-10]") in
+    1) status;; 2) if command -v khaymali-tui >/dev/null; then khaymali-tui; else warn "khaymali-tui not installed"; fi;;
+    3) logs;; 4) r=$(role_pick) && journalctl -u "khaymali-$r" -f -o cat;;
+    5) svc start;; 6) svc restart;; 7) svc stop;; 8) manage_keys;; 9) forwards;; 10) edit_cfg;;
+    0|b|"") return;; *) warn "unknown choice";; esac; pause; done; }
+
+menu_optimize(){ while true; do header "Optimize"
+  item 1 "Kernel tuning / BBR" "fq, bbr, big buffers, port range"
+  item 2 "Revert tuning"       "back to cubic / system defaults"
+  item 3 "Tuning status"       "current qdisc + congestion control"
+  item 4 "Fix clock"           "NTP or ktime (fixes timestamp skew)"
+  item 5 "Clock check"         "skew against HTTPS time"
+  item 6 "Restart timer"       "daily scheduled restart"
+  item 0 "Back"                ""
+  case $(choice "[0-6]") in 1) tune;; 2) tune_revert;; 3) sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc;;
+    4) fix_clock;; 5) clock_report;; 6) timers;; 0|b|"") return;; *) warn "unknown choice";; esac; pause; done; }
+
+menu_backup(){ while true; do header "Backup & Restore"
+  item 1 "Backup now"     "all roles + keys in one file"
+  item 2 "Restore"        "pick an archive, re-apply roles"
+  item 3 "List backups"   "$BK"
+  item 4 "Disk cleanup"   "vacuum logs, keep 5 newest backups"
+  item 0 "Back"           ""
+  case $(choice "[0-4]") in 1) backup;; 2) restore;; 3) ls -lht "$BK" 2>/dev/null || warn "no backups";; 4) cleanup;;
+    0|b|"") return;; *) warn "unknown choice";; esac; pause; done; }
+
+menu_update(){ while true; do header "Update"
+  item 1 "Update all"       "binary + manager + TUI, re-apply roles"
+  item 2 "Update manager"   "only scripts"
+  item 3 "Versions"         "installed versions"
+  item 0 "Back"             ""
+  case $(choice "[0-3]") in 1) update;; 2) update_manager;; 3) echo "manager $VERSION_MGR | $("$BIN" version 2>/dev/null)";;
+    0|b|"") return;; *) warn "unknown choice";; esac; pause; done; }
+
+# ---------- Native Khaymali Tunneling Suite (pure tunneling, no web panel) ----------
+menu_tunnel_suite(){ while true; do header "Khaymali Tunneling Suite"
+  section "Diagnostics & Routing"
+  item 1 "Tunnel health (3-layer)"   "service + session + live data check"
+  item 2 "Dial route (auto/gre/pub)" "show or change smart dial mode"
+  item 3 "Multi-carrier PathTest"    "serve or run pt1_ carrier benchmark"
+  item 4 "Reverse-Path Doctor"       "diagnose/fix asymmetric routing"
+  item 5 "Kernel Ops Doctor & Tune"  "BBR, fq qdisc, MTU probing, rp_filter"
+  section "Carriers & Engines"
+  item 6 "GRE Wraps & /30 Pair"      "direct, wss, 6to4, 4in6 + Path MTU"
+  item 7 "Spoof + WireGuard"         "generate configs, spf1_ bundle, status"
+  item 8 "FRP / Backhaul Setup"      "iran/foreign/from-bundle (hsh1_/bh1_/gh1_)"
+  item 9 "Xray REALITY / SSH Fwd"    "keygen, VLESS/bridge JSON, SSH lock-key"
+  item 10 "Live Carrier Swap"        "swap active exit URI or build bundle"
+  section "Resilience & Micro-NLP"
+  item 11 "Cluster Hub Mesh & LB"    "hc1_ join code, hub-fwd, nft LB rules"
+  item 12 "Harsh-Network Micro-NLP"  "status or switch shadow / active live"
+  item 0 "Back"                      ""
+  case $(choice "[0-12]") in
+    1) "$BIN" health || true;;
+    2) read -rp "  mode [status|auto|gre|public]: " m
+       case "${m:-status}" in status) "$BIN" dial status || true;;
+         auto|gre|public) "$BIN" dial set "$m" || true;; *) warn "invalid mode";; esac;;
+    3) read -rp "  [serve|run]: " pm
+       if [ "$pm" = serve ]; then read -rp "  public IPv4: " ip; "$BIN" pathtest serve --host "$ip"
+       elif [ "$pm" = run ]; then read -rp "  pt1_ code: " code; "$BIN" pathtest run "$code"
+       else warn "enter serve or run"; fi;;
+    4) read -rp "  GRE iface [gre-tunnel]: " ifc; read -rp "  local inner IP: " li; read -rp "  peer inner IP: " pi; read -rp "  peer public IP: " pp
+       "$BIN" revpath check --iface "${ifc:-gre-tunnel}" --local-inner "$li" --peer-inner "$pi" --peer-pub "$pp" || true;;
+    5) "$BIN" ops doctor; read -rp "  Apply BBR/FQ kernel tuning now? [y/N]: " yn
+       [ "$(lc "$yn")" = y ] && "$BIN" ops tune --apply;;
+    6) "$BIN" carrier pair;;
+    7) "$BIN" spoof status || true;;
+    8) read -rp "  Paste hsh1_/bh1_/gh1_ bundle (empty to skip): " b
+       [ -n "$b" ] && "$BIN" setup from-bundle "$b" --plan;;
+    9) "$BIN" xray keygen;;
+    10) read -rp "  Target exit URI or 'auto': " tgt
+        [ -n "$tgt" ] && "$BIN" carrier swap "$tgt" || true;;
+    11) read -rp "  Peer hub IP for hub-fwd NAT rules: " ph
+        [ -n "$ph" ] && "$BIN" mesh hub-fwd --port 443 --proto both --peer-hub "$ph";;
+    12) "$BIN" harsh-nlp status 2>/dev/null || "$BIN" harsh-nlp eval --mode shadow
+        read -rp "  Switch live mode [shadow|active|skip]: " nm
+        case "$nm" in shadow|active) "$BIN" harsh-nlp mode "$nm" || true;; esac;;
+    0|b|"") return;; *) warn "unknown choice";; esac; pause; done; }
+
+cli_help(){ cat <<EOF
+  ${c_b}Command line (no menu):${c_0}
+    khaymali-manager setup-exit | join CODE [direct|bridge] | join-bridge CODE
+    khaymali-manager join-code | push USER@IP | allow KEY
+    khaymali-manager status | doctor [IP PORT] | logs | clock | fix-clock
+    khaymali-manager tune | tune-revert | tune-status | backup | restore FILE
+    khaymali-manager suite | update | update-manager | cleanup | version
+EOF
+}
+
 menu(){
   while true; do
-    clear 2>/dev/null
-    echo "${c_b}Khaymali manager $VERSION_MGR${c_0}  | $("$BIN" version 2>/dev/null) | roles: $(roles | xargs)"
-    cat <<'EOF'
-  1) Setup EXIT  (abroad)          9) Doctor: Direct or Bridge?
-  2) Setup ENTRY (Iran)           10) Port forwards
-  3) Setup BRIDGE                 11) Edit config (auto-rollback)
-  4) Status                       12) Scheduled restart timer
-  5) Logs                         13) Kernel tuning / BBR   13r) revert
-  6) Restart service              14) Fix clock (NTP / ktime)
-  7) Stop service                 15) Backup    15r) Restore
-  8) Manage keys / join code      16) Disk & log cleanup
-  p) Push & install on Iran (SSH) 17) Update binary   17m) Update manager
-  t) Live dashboard (TUI)         99) Uninstall      0) Quit
-EOF
-    case $(lc "$(ask "Choice")") in
-      1) setup_exit;; 2) setup_entry;; 3) setup_bridge;; 4) status;; 5) logs;;
-      6) svc restart;; 7) svc stop;; 8) manage_keys;; 9) doctor;; 10) forwards;;
-      11) edit_cfg;; 12) timers;; 13) tune;; 13r) tune_revert;; 14) fix_clock;;
-      15) backup;; 15r) restore;; 16) cleanup;; 17) update;; 17m) update_manager;; 99) uninstall;;
-      p) push_to "";;
-      t) if command -v khaymali-tui >/dev/null; then khaymali-tui; else warn "khaymali-tui not installed"; fi;;
-      0|q) exit 0;; *) warn "unknown choice";;
+    header
+    echo
+    item 0 "Connection Test"   "doctor: direct or bridge? clock, DNS, ports"
+    item 1 "Setup"             "exit (abroad) / entry (Iran) / bridge"
+    item 2 "Manage"            "status, logs, service, keys, forwards"
+    item 3 "Status"            "quick health report"
+    item 4 "Live Dashboard"    "real-time TUI"
+    item 5 "Optimize"          "BBR, buffers, clock, restart timer"
+    item 6 "Backup & Restore"  "all config in one file, cleanup"
+    item 7 "Update"            "latest GitHub release"
+    item ts "Tunneling Suite"  "GRE, Spoof, FRP/Backhaul, Xray, Mesh, NLP"
+    item 8 "Uninstall"         "remove everything (backup kept)"
+    item 9 "Exit"              ""
+    echo
+    printf "  ${c_d}shortcuts: e=setup exit  i=setup iran  j=join code  p=push  k=keys  f=forwards  ts=suite  h=help${c_0}\n"
+    echo "${c_d}$LINE${c_0}"
+    case $(choice "[0-9]") in
+      0) doctor;; 1) menu_setup; continue;; 2) menu_manage; continue;; 3) status;;
+      4|t) if command -v khaymali-tui >/dev/null; then khaymali-tui; else warn "khaymali-tui not installed"; fi;;
+      5) menu_optimize; continue;; ts|suite) menu_tunnel_suite; continue;; 6) menu_backup; continue;; 7) menu_update; continue;;
+      8|99) uninstall;; 9|0q|q|quit|exit) exit 0;;
+      e) setup_exit;; i) setup_entry;; j) show_join;; p) push_to "";; k) manage_keys;; f) forwards;; h|"?") cli_help;;
+      "") continue;; *) warn "unknown choice";;
     esac
     pause
   done
@@ -452,6 +601,7 @@ case "$(lc "${1:-menu}")" in
   fix-clock) fix_clock;; clock) clock_report;;
   update) update;; update-manager) update_manager;; backup) backup;; restore) shift; restore "${1:-}";;
   tune) tune;; tune-revert) tune_revert;; tune-status) sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc;;
+  suite|ts) menu_tunnel_suite;;
   cleanup) cleanup;; version) echo "khaymali-manager $VERSION_MGR";;
-  *) echo "usage: khaymali-manager [menu|setup-exit|join CODE [direct|bridge]|join-bridge CODE|join-code|push USER@IP|allow KEY|status|doctor [IP PORT]|fix-clock|clock|logs|update|update-manager|backup|restore FILE|tune|tune-revert|cleanup]"; exit 2;;
+  *) echo "usage: khaymali-manager [menu|setup-exit|join CODE [direct|bridge]|join-bridge CODE|join-code|push USER@IP|allow KEY|status|doctor [IP PORT]|fix-clock|clock|logs|update|update-manager|backup|restore FILE|tune|tune-revert|suite|cleanup]"; exit 2;;
 esac
