@@ -1,6 +1,6 @@
 # Khaymali Tunnel v0.22.0 · تانل خایمالی
 
-> **تانل ضدفیلترینگ متنباز (MIT) نوشتهشده با Rust، نسخهی Pure Tunneling.** برای سرورهای ایراناکسس و شبکههای محدود ساخته شده و این امکانات رو داره: رمزنگاری سرتاسری `Noise_IK`، استتار TLS با Fallback ایزوله، فوروارد پورت لایه ۴، **Tunneling Suite** (GRE/FOU، Spoof، FRP/Backhaul، Xray، SSH، WebSocket)، **Pool و Autopilot** برای جابهجایی خودکار حامل، **Cluster Mesh و Load Balancer**، و **Micro-NLP برای شبکههای سخت**.
+> **تانل ضدفیلترینگ متن باز (MIT) نوشته شده با Rust، نسخه ی Pure Tunneling.** برای سرورهای ایران اکسس و شبکه های محدود ساخته شده و این امکانات رو داره: رمزنگاری سرتاسری `Noise_IK`، استتار TLS با Fallback ایزوله، فوروارد پورت لایه ۴، **Tunneling Suite** (GRE/FOU، Spoof، FRP/Backhaul، Xray، SSH، WebSocket)، **Pool و Autopilot** برای جابجایی خودکار حامل، **Cluster Mesh و Load Balancer**، و **Micro-NLP برای شبکه های سخت**.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE) [![Rust 1.75+](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](#۱۰-ساخت-از-سورس-و-تستها) [![Crypto](https://img.shields.io/badge/crypto-Noise__IK-blue.svg)](#۱-تانل-خایمالی-چیست-و-چطور-کار-میکند) [![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey.svg)](#۴-نصب-تکخطی) [![CI](https://github.com/DevSorena/khaymali/actions/workflows/ci.yml/badge.svg)](https://github.com/DevSorena/khaymali/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/DevSorena/khaymali)](https://github.com/DevSorena/khaymali/releases/latest)
 
