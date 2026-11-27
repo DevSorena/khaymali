@@ -276,6 +276,7 @@ ok "Installed: $("$PREFIX/khaymali" version 2>/dev/null || echo khaymali)"
 echo "  Host readiness check : khaymali doctor"
 echo "  Generate keys        : khaymali keygen"
 echo "  Menu                 : khaymali-manager"
+echo "  Menu                 : khaymali-manager"
 echo "  Help / all commands  : khaymali --help"
 echo "  systemd unit samples : https://github.com/$REPO/tree/main/deploy/systemd"
 if [ -t 0 ] && [ -t 1 ] && [ "${KHAYMALI_NO_MENU:-0}" != 1 ]; then
