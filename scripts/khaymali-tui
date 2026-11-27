@@ -497,8 +497,13 @@ def wizard_setup(stdscr, role: str):
 
 def run_tui(stdscr, store: DataStore):
     curses.curs_set(0)
-    stdscr.nodelay(True)
-    stdscr.timeout(1000)
+    stdscr.keypad(True)          # arrows/F-keys as KEY_* instead of raw ESC sequences
+    os.environ.setdefault('ESCDELAY', '25')
+    try:
+        curses.set_escdelay(25)
+    except Exception:
+        pass
+    stdscr.timeout(200)
 
     curses.start_color()
     curses.use_default_colors()
@@ -831,14 +836,38 @@ def run_tui(stdscr, store: DataStore):
         ch = stdscr.getch()
         if ch == -1:
             continue
+        if ch == 27:  # raw ESC sequence fallback (terminals that bypass keypad)
+            stdscr.timeout(30)
+            seq = ""
+            while True:
+                c2 = stdscr.getch()
+                if c2 == -1 or len(seq) > 6:
+                    break
+                seq += chr(c2)
+            stdscr.timeout(200)
+            ch = {"[A": curses.KEY_UP, "OA": curses.KEY_UP, "[B": curses.KEY_DOWN, "OB": curses.KEY_DOWN,
+                  "[C": curses.KEY_RIGHT, "OC": curses.KEY_RIGHT, "[D": curses.KEY_LEFT, "OD": curses.KEY_LEFT,
+                  "[Z": curses.KEY_BTAB}.get(seq, 27 if seq == "" else -1)
+            if ch == -1:
+                continue
+        if ch in (curses.KEY_RIGHT, ord("]")):
+            tab_idx = (tab_idx + 1) % len(TABS); focus = "main"; continue
+        if ch in (curses.KEY_LEFT, curses.KEY_BTAB, ord("[")):
+            if focus == "main" and tab_idx == 0:
+                focus = "sidebar"
+            else:
+                tab_idx = (tab_idx - 1) % len(TABS); focus = "main"
+            continue
+        if ch in (ord("1"), ord("2"), ord("3"), ord("4")):
+            tab_idx = ch - ord("1"); focus = "main"; continue
         if ch in (ord("q"), ord("Q")):
             break
-        elif ch == 9:  # Tab
+        elif ch in (9, curses.KEY_STAB):  # Tab
             tab_idx = (tab_idx + 1) % len(TABS)
             focus = "main"
         elif ch == 27:  # Esc
             focus = "sidebar" if focus == "main" else "main"
-        elif ch == curses.KEY_UP:
+        elif ch in (curses.KEY_UP, ord("k")) and not (focus == "main" and ch == ord("k")):
             if focus == "sidebar":
                 sidebar_idx = (sidebar_idx - 1) % len(SIDEBAR_ITEMS)
             elif tab_idx == 2 and store.tunnels:
