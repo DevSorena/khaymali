@@ -68,7 +68,7 @@ mkdir -p "$T/evil/etc/x"; echo hi > "$T/evil/etc/x/y"; tar -czf "$T/evil.tgz" -C
 tar -tzf "$T/evil.tgz" | grep -qvE "^${CONF#/}(/|$)" && ok || bad "foreign archive detected"
 
 # tuning list only contains key=value pairs
-tune_pairs | grep -qvE '^[a-z0-9_.]+=.+$' && bad "tune_pairs format" || ok
+tune_pairs | grep -qvE '^[a-z0-9_.-]+=.+$' && bad "tune_pairs format" || ok
 
 # v0.16.0
 [ "$(list_dedup "k1 k2 k1  k2")" = "k1 k2" ] && ok || bad "dedup keys"

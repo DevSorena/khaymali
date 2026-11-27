@@ -7,6 +7,7 @@ VERSION_MGR="0.16.0"
 REPO="${KHAYMALI_REPO:-DevSorena/khaymali}"
 BIN="${KHAYMALI_BINPATH:-${KHAYMALI_BIN:-/usr/local/bin/khaymali}}"
 ETC="${KHAYMALI_CONF:-/etc/khaymali}"
+CONF="$ETC"   # legacy name used by tests
 UNIT="${KHAYMALI_UNITDIR:-/etc/systemd/system}"
 BK="${KHAYMALI_BACKUP_DIR:-/var/backups/khaymali}"
 POOL_DEFAULT="${KHAYMALI_POOL:-16}"
