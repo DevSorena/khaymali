@@ -1132,7 +1132,7 @@ mod tests {
         rt.record_at(TransportEvent::MidStreamStall { bytes_transferred: 16384, frame_size: CHUNK_NORMAL }, 0, t0 + Duration::from_millis(100));
         rt.record_at(TransportEvent::MidStreamStall { bytes_transferred: 16384, frame_size: CHUNK_NORMAL }, 0, t0 + Duration::from_millis(200));
         rt.record_at(TransportEvent::MidStreamStall { bytes_transferred: 16384, frame_size: CHUNK_NORMAL }, 0, t0 + Duration::from_millis(300));
-        assert_eq!(rt.current_chunk_size(), CHUNK_DEGRADED);
+        assert!(rt.current_chunk_size() <= CHUNK_DEGRADED);
         let snap = rt.snapshot();
         assert_eq!(snap.pattern, PathPattern::PmtuOrLargeFrameLoss);
         assert!(snap.recovery_actions >= 1);

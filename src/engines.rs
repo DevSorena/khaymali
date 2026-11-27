@@ -940,7 +940,7 @@ mod tests {
             ctrl_port: 3080,
             local_gre: String::new(),
             peer_gre: String::new(),
-            token: "tok_setup_123456".into(),
+            token: "toksetup123456".into(),
             raw_ports: vec!["443".into(), "8443".into()],
             accept_udp: true,
             udp_companion_port: 3081,

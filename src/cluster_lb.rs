@@ -12,7 +12,7 @@
 
 use crate::cluster_mesh::{sync_open, sync_seal, MeshBeat, DNS_MAX_TTL, DNS_MIN_TTL};
 use crate::hjson::{self, Json};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
