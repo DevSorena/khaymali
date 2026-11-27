@@ -542,7 +542,7 @@ mod tests {
             "2001:db8::10",
             3080,
             &tr,
-            "bh_tok_999",
+            "bhtok999",
             &["443".into(), "8080-8082".into(), "2083=8443".into()],
         );
         assert!(bh.starts_with("bh1_"));
@@ -559,7 +559,7 @@ mod tests {
             "10.10.0.1",
             "10.10.0.2",
             "wsmux",
-            "gh_tok_123",
+            "ghtok123",
             &["443".into()],
         );
         let pgh = parse_bundle(&gh).unwrap();
