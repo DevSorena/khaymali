@@ -282,10 +282,9 @@ khaymali diagnose "read timeout stalled at 16384 bytes"
 
 ## ۱۰. ساخت از سورس و تست‌ها
 
-پروژه با `rustc 1.75+` ساخته می‌شود. این آرشیو `Cargo.lock` تولیدشده ندارد؛ برای ساخت محلی ابتدا وابستگی‌ها را resolve و lockfile را بازبینی کنید. برای انتشار عمومی، `Cargo.lock` باید commit شود:
+پروژه با `rustc 1.75+` ساخته می‌شود و برای بیلدهای تکرارپذیر در CI و انتشار عمومی از `Cargo.lock` قفل‌شده با `--locked` استفاده می‌کند:
 
 ```bash
-cargo generate-lockfile
 cargo build --release --locked
 cargo test --release --locked --lib -- --nocapture
 cargo test --release --locked --test neg_security -- --nocapture
@@ -315,7 +314,7 @@ python3 scripts/check_baseline_regression.py baseline.json candidate.json
 
 # 🇬🇧 English Guide
 
-**Khaymali Tunnel** is an open-source (MIT) tunnel written in Rust (`rustc 1.75+`). This source archive does not include a generated `Cargo.lock`; generate and review one before using `--locked`, and commit it for reproducible public releases.
+**Khaymali Tunnel** is an open-source (MIT) tunnel written in Rust (`rustc 1.75+`) using a committed `Cargo.lock` for reproducible `--locked` builds.
 
 ```text
 user app ──(SOCKS5 / L4 Forward)──► ENTRY ◄──(reverse dial)── BRIDGE ──(dial out)──► EXIT ──► internet
