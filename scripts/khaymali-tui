@@ -828,9 +828,18 @@ def run_tui(stdscr, store: DataStore):
 
         stdscr.refresh()
 
-        ch = stdscr.getch()
-        if ch == -1:
-            continue
+$1        if ch == 27:  # raw escape sequence (terminals without keypad terminfo)
+            stdscr.nodelay(True)
+            seq = []
+            for _ in range(2):
+                n = stdscr.getch()
+                if n == -1:
+                    break
+                seq.append(n)
+            stdscr.timeout(1000)
+            if len(seq) == 2 and seq[0] in (91, 79):
+                ch = {65: curses.KEY_UP, 66: curses.KEY_DOWN,
+                      67: curses.KEY_RIGHT, 68: curses.KEY_LEFT}.get(seq[1], 27)
         if ch in (ord("q"), ord("Q")):
             break
         elif ch == 9:  # Tab
@@ -838,8 +847,13 @@ def run_tui(stdscr, store: DataStore):
             focus = "main"
         elif ch == 27:  # Esc
             focus = "sidebar" if focus == "main" else "main"
-        elif ch == curses.KEY_UP:
-            if focus == "sidebar":
+        elif ch == curses.KEY_RIGHT:
+            tab_idx = (tab_idx + 1) % len(TABS)
+            focus = "main"
+        elif ch == curses.KEY_LEFT:
+            tab_idx = (tab_idx - 1) % len(TABS)
+            focus = "main"
+$1            if focus == "sidebar":
                 sidebar_idx = (sidebar_idx - 1) % len(SIDEBAR_ITEMS)
             elif tab_idx == 2 and store.tunnels:
                 sel_tunnel = (sel_tunnel - 1) % len(store.tunnels)
@@ -933,7 +947,8 @@ def main():
     if not args.demo and os.geteuid() != 0:
         print("note: run as root for start/stop/setup actions", file=sys.stderr)
     store = DataStore(demo=args.demo, control_sock=args.control, metrics_url=args.metrics)
-    curses.wrapper(run_tui, store)
+    os.environ.setdefault("ESCDELAY", "25")
+$1
 
 
 if __name__ == "__main__":
