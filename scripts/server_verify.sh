@@ -15,19 +15,19 @@
 # A failing step never stops the run. Final summary: <out>/server_verify_report.txt
 # Exit code: 0 = no FAIL, 1 = at least one FAIL. SKIP means "not testable on this host" (reason shown).
 set -u
-ROOT="$(cd "$(dirname "\$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 2
 
 QUICK=0; SKIP_BUILD=0; BIN=""; OUT=""; REPEATS="${REPEATS:-2}"; STRESS_STEPS="${STRESS_STEPS:-200 250 300}"
 while (( $# )); do
-  case "\$1" in
+  case "$1" in
     --quick) QUICK=1; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --bin) BIN="${2:?--bin needs a path}"; shift 2 ;;
     --out) OUT="${2:?--out needs a directory}"; shift 2 ;;
     --repeats) REPEATS="${2:?--repeats needs a number}"; shift 2 ;;
-    -h|--help) sed -n '2,17p' "\$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "unknown option: \$1 (see --help)" >&2; exit 2 ;;
+    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
 OUT="${OUT:-/tmp/khaymali-server-verify-$(date +%Y%m%d-%H%M%S)}"
@@ -40,14 +40,14 @@ if [ -t 1 ]; then G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; Z=$'\e[0m'; else G=""; 
 NP=0; NF=0; NS=0
 say()  { printf '%s\n' "$*" | tee -a "$REPORT"; }
 rec()  { # status name detail
-  case "\$1" in
+  case "$1" in
     PASS) NP=$((NP+1)); c=$G ;; FAIL) NF=$((NF+1)); c=$R ;; *) NS=$((NS+1)); c=$Y ;;
   esac
-  printf '%s%-5s%s %-34s %s\n' "$c" "\$1" "$Z" "\$2" "${3:-}"
-  printf '%-5s %-34s %s\n' "\$1" "\$2" "${3:-}" >> "$REPORT"
+  printf '%s%-5s%s %-34s %s\n' "$c" "$1" "$Z" "$2" "${3:-}"
+  printf '%-5s %-34s %s\n' "$1" "$2" "${3:-}" >> "$REPORT"
 }
 step() {
-  local name="\$1" to="\$2"; shift 2
+  local name="$1" to="$2"; shift 2
   local log="$OUT/logs/$name.log" t0 rc
   t0=$(date +%s)
   timeout "$to" "$@" >"$log" 2>&1; rc=$?
@@ -55,8 +55,8 @@ step() {
   elif [ $rc -eq 124 ]; then rec FAIL "$name" "timeout after ${to}s  log: $log"
   else rec FAIL "$name" "exit $rc  log: $log ; last: $(tail -n 1 "$log" | cut -c1-100)"; fi
 }
-skip() { rec SKIP "\$1" "\$2"; }
-have() { command -v "\$1" >/dev/null 2>&1; }
+skip() { rec SKIP "$1" "$2"; }
+have() { command -v "$1" >/dev/null 2>&1; }
 IS_ROOT=0; [ "$(id -u)" -eq 0 ] && IS_ROOT=1
 
 say "=== Khaymali server verification  $(date -u +%FT%TZ) ==="
@@ -73,12 +73,12 @@ if [ -n "$MISSING" ]; then rec FAIL preflight-tools "missing:$MISSING"; else rec
 if ! have cc && ! have gcc && [ "$SKIP_BUILD" = 0 ] && [ -z "${KHAYMALI_NO_CARGO:-}" ]; then
   rec FAIL preflight-compiler "no C compiler/linker (cc) in PATH"
   say ""; say "Aborting: install the build tools first:  apt update && apt install -y build-essential pkg-config"
-  say "(or build elsewhere and run:  bash \$0 --skip-build --bin /path/to/khaymali)"
+  say "(or build elsewhere and run:  bash $0 --skip-build --bin /path/to/khaymali)"
   exit 1
 fi
 rec PASS preflight-compiler
 if ! have cargo && [ -x "$HOME/.cargo/bin/cargo" ]; then
-  say "NOTE: cargo exists in ~/.cargo/bin but not in PATH (sudo resets PATH). Run:  sudo env \"PATH=\$PATH:$HOME/.cargo/bin\" bash \$0 $*"
+  say "NOTE: cargo exists in ~/.cargo/bin but not in PATH (sudo resets PATH). Run:  sudo env \"PATH=$PATH:$HOME/.cargo/bin\" bash $0 $*"
 fi
 BUSY="$(python3 -I - <<'PY' 2>/dev/null
 import socket
@@ -148,7 +148,7 @@ if [ $IS_ROOT = 1 ]; then
   step doctor 120 "$BIN" doctor
   if have ip && have tc; then
     step netns-veth-netem 120 bash -c '
-      set -e; N="\$1"
+      set -e; N="$1"
       trap "ip netns del $N 2>/dev/null; ip link del vk$N 2>/dev/null" EXIT
       ip netns add "$N"
       ip link add "vk$N" type veth peer name "vp$N"
