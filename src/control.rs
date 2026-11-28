@@ -419,9 +419,10 @@ mod unix_impl {
             }
             "sessions.status" => {
                 format!(
-                    "{{\"ok\":true,\"resumable_sessions_active\":{},\"sessions_resumed_total\":{}}}\n",
+                    "{{\"ok\":true,\"resumable_sessions_active\":{},\"sessions_resumed_total\":{},\"session_retransmits_total\":{}}}\n",
                     stats::RESUMABLE_SESSIONS_ACTIVE.load(Relaxed),
                     stats::SESSIONS_RESUMED.load(Relaxed),
+                    stats::SESSION_RETRANSMITS.load(Relaxed),
                 )
             }
             "transports.list" => {

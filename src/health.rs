@@ -688,13 +688,28 @@ pub async fn probe_loop(exits: Arc<Exits>, period: Duration) {
         sleep(period).await;
         exits.evaluate_tick();
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn path_intel_tiebreaker_is_bounded_and_respects_circuit_state() {
         let mut s = St {
-            addr: "1.1.1.1:4440".into(), ewma_ms: 100.0, min_rtt_ms: 100.0, jitter_ms: 0.0,
-            cusum: 0.0, samples: 5, fails: 0, timeout_fails: 0, reset_fails: 0, stalls: 0,
-            circuit: CircuitState::Closed, down_until: None, half_open_probe_sent: false,
+            addr: "1.1.1.1:4440".into(),
+            ewma_ms: 100.0,
+            min_rtt_ms: 100.0,
+            jitter_ms: 0.0,
+            cusum: 0.0,
+            samples: 5,
+            fails: 0,
+            timeout_fails: 0,
+            reset_fails: 0,
+            stalls: 0,
+            circuit: CircuitState::Closed,
+            down_until: None,
+            half_open_probe_sent: false,
             intel_score: Some((100.0, 10)),
         };
         assert!((Exits::apply_intel_tiebreaker(100.0, &s, false) - 100.0).abs() < 1e-6);
@@ -703,7 +718,8 @@ pub async fn probe_loop(exits: Arc<Exits>, period: Duration) {
         assert!((Exits::apply_intel_tiebreaker(100.0, &s, true) - 120.0).abs() < 1e-6);
         s.intel_score = Some((100.0, 3));
         assert!((Exits::apply_intel_tiebreaker(100.0, &s, true) - 100.0).abs() < 1e-6);
-        s.intel_score = Some((100.0, 10)); s.circuit = CircuitState::Open;
+        s.intel_score = Some((100.0, 10));
+        s.circuit = CircuitState::Open;
         assert!((Exits::apply_intel_tiebreaker(100.0, &s, true) - 100.0).abs() < 1e-6);
     }
 }

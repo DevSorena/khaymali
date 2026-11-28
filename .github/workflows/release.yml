@@ -5,15 +5,18 @@ on:
     tags:
       - "v*"
 
+# Minimal workflow-level permissions; write scopes are granted per-job only where required.
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
   build:
     name: Build static ${{ matrix.name }}
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       matrix:
         include:
@@ -52,7 +55,12 @@ jobs:
           "$B" keygen | grep -q public
           "$B" transports | grep -q wss
 
-      - name: Package tarball & SHA-256
+      - name: Cross-build notice (arm64 not runtime smoke-tested on amd64 runner)
+        if: matrix.name != 'linux-amd64'
+        run: |
+          echo "NOTE: ${{ matrix.name }} was cross-compiled statically; runtime smoke checks only execute on native linux-amd64." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package tarball & SHA-256 (allowlist-verified)
         run: |
           STAGE="khaymali-${{ matrix.name }}"
           mkdir -p "$STAGE/deploy" "$STAGE/scripts"
@@ -61,9 +69,15 @@ jobs:
           # helpers ship INSIDE the archive so install.sh never has to pull unverified code from main
           cp scripts/khaymali-tui scripts/khaymali-manager "$STAGE/"
           cp install.sh "$STAGE/scripts/"
-          cp scripts/server_verify.sh scripts/real_path_check.sh "$STAGE/scripts/"
+          cp scripts/server_verify.sh scripts/netns_veth_check.sh scripts/real_path_check.sh "$STAGE/scripts/"
           cp scripts/stress_live_300.sh scripts/check_baseline_regression.py scripts/ab_compare.py scripts/eval_nlp_replay.py scripts/make_annotation_set.py "$STAGE/scripts/"
           cp LICENSE README.md SECURITY.md CHANGELOG.md "$STAGE/"
+          # Audit staged content: reject accidental private keys or backup/temp artifacts
+          if find "$STAGE" -type f \( -name '*.pem' -o -name '*.key' -o -name '*.env' -o -name '*.bak' \) | grep -q .; then
+            echo "ERROR: unexpected sensitive or temporary file in release staging directory" >&2
+            exit 1
+          fi
+          (cd "$STAGE" && find . -type f | LC_ALL=C sort | xargs sha256sum) > "$STAGE/RELEASE_MANIFEST.sha256"
           tar -czf "khaymali-${{ matrix.name }}.tar.gz" "$STAGE"
           sha256sum "khaymali-${{ matrix.name }}.tar.gz" > "khaymali-${{ matrix.name }}.tar.gz.sha256"
 
@@ -82,6 +96,8 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:

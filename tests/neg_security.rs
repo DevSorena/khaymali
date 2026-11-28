@@ -663,7 +663,7 @@ async fn neg_19_end_to_end_mux_carrier_session_resume_across_carrier_kill() {
     let (xsk1, al1, er1) = (xsk.clone(), allowed.clone(), exit_reg.clone());
     let exit_c1 = tokio::spawn(async move {
         let lk = link::respond(Box::new(b1), &xsk1, &al1).await.unwrap();
-        let _ = serve_exit_with_registry(lk, true, er1).await;
+        let _ = serve_exit_with_registry(lk, true, er1, xpk.clone()).await;
     });
     let entry_lk1 = link::initiate(Box::new(a1), &esk, &xpk).await.unwrap();
     let carrier1 = MuxCarrier::spawn(entry_lk1, Duration::from_secs(60));
@@ -692,7 +692,7 @@ async fn neg_19_end_to_end_mux_carrier_session_resume_across_carrier_kill() {
     let (xsk2, al2, er2) = (xsk, allowed, exit_reg);
     let exit_c2 = tokio::spawn(async move {
         let lk = link::respond(Box::new(b2), &xsk2, &al2).await.unwrap();
-        let _ = serve_exit_with_registry(lk, true, er2).await;
+        let _ = serve_exit_with_registry(lk, true, er2, xpk).await;
     });
     let entry_lk2 = link::initiate(Box::new(a2), &esk, &xpk).await.unwrap();
     let carrier2 = MuxCarrier::spawn(entry_lk2, Duration::from_secs(60));

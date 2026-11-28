@@ -18,7 +18,7 @@
 use crate::link::{self, Link, CHUNK};
 use crate::recovery::{AdaptiveRuntime, TransportEvent};
 use crate::session_resume::{
-    compute_resume_proof, ResumeFrame, SessionId, SessionOwner, SessionRegistry,
+    authorize_attach, compute_resume_proof, ResumeFrame, SessionId, SessionOwner, SessionRegistry,
     DEFAULT_SESSION_DETACH_TTL,
 };
 use crate::stats;
@@ -40,8 +40,10 @@ pub const MUX_MAX_STREAMS_PER_CARRIER: usize = 128;
 pub const REKEY_MAX_BYTES: u64 = 512 * 1024 * 1024;
 pub const REKEY_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
-const STREAM_CHAN_CAP: usize = 64;
-const CARRIER_TX_CAP: usize = 256;
+const STREAM_CHAN_CAP: usize = 128;
+const CARRIER_TX_CAP: usize = 512;
+const EXIT_CARRIER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const CARRIER_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 
 const CMD_SYN: u8 = 1;
 const CMD_SYN_OK: u8 = 2;
@@ -196,8 +198,10 @@ impl ResumableMuxStream {
         };
 
         let down = async {
+            let mut got_eof = false;
             while let Some(chunk) = self.to_socket_rx.recv().await {
                 if chunk.is_empty() {
+                    got_eof = true;
                     break; // in-band EOF from the exit: the target closed
                 }
                 stats::BYTES_DOWN.fetch_add(chunk.len() as u64, Relaxed);
@@ -205,6 +209,9 @@ impl ResumableMuxStream {
                 tw.write_all(&chunk).await?;
             }
             let _ = tw.shutdown().await;
+            if !got_eof {
+                bail!("resumable session closed before EOF");
+            }
             Ok::<(), anyhow::Error>(())
         };
 
@@ -365,7 +372,7 @@ struct CarrierState {
 /// A carrier with work in flight that has not received a single frame for this long is treated as
 /// frozen (silent black hole, middlebox stall) and replaced; resumable sessions move to another
 /// carrier. Before this, a frozen carrier stayed "alive" forever and swallowed every stream on it.
-const CARRIER_STALL: Duration = Duration::from_secs(15);
+const CARRIER_STALL: Duration = Duration::from_secs(25);
 /// With work in flight, probe a quiet carrier after this long (any reply, even a PONG, proves life).
 const CARRIER_PING_AFTER: Duration = Duration::from_secs(4);
 /// An idle carrier is pinged every 15 s by its writer; no frame at all for this long means dead.
@@ -381,6 +388,10 @@ pub struct MuxCarrier {
     created: Instant,
     /// Milliseconds since `created` at which the last frame arrived (stall detection).
     last_rx_ms: AtomicU64,
+    /// Milliseconds since `created` at which the carrier became busy (0 = idle).
+    busy_since_ms: AtomicU64,
+    /// Prefer a flag over try_send so a full data queue does not drop keepalives.
+    ping_pending: AtomicBool,
     max_age: Duration,
     peer_pub: Vec<u8>,
     state: StdMutex<CarrierState>,
@@ -401,6 +412,8 @@ impl MuxCarrier {
             draining: AtomicBool::new(false),
             created: Instant::now(),
             last_rx_ms: AtomicU64::new(0),
+            busy_since_ms: AtomicU64::new(0),
+            ping_pending: AtomicBool::new(false),
             max_age: effective_max_age,
             peer_pub,
             state: StdMutex::new(CarrierState {
@@ -420,18 +433,32 @@ impl MuxCarrier {
         tokio::spawn(async move {
             let mut sent_rekey = false;
             loop {
+                if !c_wr.alive.load(Relaxed) {
+                    break;
+                }
+                if c_wr.ping_pending.swap(false, Relaxed)
+                    && !matches!(
+                        timeout(CARRIER_WRITE_TIMEOUT, lw.send(&encode_frame(CMD_PING, 0, &[]))).await,
+                        Ok(Ok(()))
+                    )
+                {
+                    break;
+                }
                 let frame = match timeout(Duration::from_secs(15), rx.recv()).await {
                     Ok(Some(f)) => f,
                     Ok(None) => break,
                     Err(_) => {
-                        if lw.send(&encode_frame(CMD_PING, 0, &[])).await.is_err() {
+                        if !matches!(
+                            timeout(CARRIER_WRITE_TIMEOUT, lw.send(&encode_frame(CMD_PING, 0, &[]))).await,
+                            Ok(Ok(()))
+                        ) {
                             break;
                         }
                         continue;
                     }
                 };
                 let flen = frame.len() as u64;
-                if lw.send(&frame).await.is_err() {
+                if !matches!(timeout(CARRIER_WRITE_TIMEOUT, lw.send(&frame)).await, Ok(Ok(()))) {
                     break;
                 }
                 let tot = c_wr.bytes_total.fetch_add(flen, Relaxed) + flen;
@@ -541,21 +568,15 @@ impl MuxCarrier {
                                         .get(&session_id)
                                         .cloned();
                                     if let Some(ow) = owner {
-                                        let tx_ack = c_rd.tx.clone();
-                                        tokio::spawn(async move {
-                                            if let Ok(new_ack) =
-                                                ow.deliver_from_carrier(epoch, seq, ack, payload).await
-                                            {
-                                                let ack_f = ResumeFrame::SeqAck {
-                                                    session_id,
-                                                    epoch,
-                                                    ack: new_ack,
-                                                };
-                                                let _ = tx_ack
-                                                    .send(encode_frame(CMD_RESUME, 0, &ack_f.encode()))
-                                                    .await;
-                                            }
-                                        });
+                                        if let Ok(Some(ack_f)) =
+                                            ow.enqueue_from_carrier(epoch, seq, ack, payload)
+                                        {
+                                            let _ = c_rd.tx.try_send(encode_frame(
+                                                CMD_RESUME,
+                                                0,
+                                                &ack_f.encode(),
+                                            ));
+                                        }
                                     }
                                 }
                                 ResumeFrame::SeqAck {
@@ -565,6 +586,18 @@ impl MuxCarrier {
                                         c_rd.state.lock().unwrap().resumable_owners.get(&session_id)
                                     {
                                         ow.apply_ack(ack);
+                                    }
+                                }
+                                ResumeFrame::SeqSack {
+                                    session_id,
+                                    ack,
+                                    ranges,
+                                    ..
+                                } => {
+                                    if let Some(ow) =
+                                        c_rd.state.lock().unwrap().resumable_owners.get(&session_id)
+                                    {
+                                        ow.apply_sack(ack, &ranges);
                                     }
                                 }
                                 ResumeFrame::SeqFin { session_id, .. } => {
@@ -602,9 +635,24 @@ impl MuxCarrier {
                         || !st.resumable_owners.is_empty()
                 };
                 let now_ms = c_mon.created.elapsed().as_millis() as u64;
-                let quiet = Duration::from_millis(now_ms.saturating_sub(c_mon.last_rx_ms.load(Relaxed)));
+                let last_rx = c_mon.last_rx_ms.load(Relaxed);
+                let quiet = if busy {
+                    let bs = match c_mon.busy_since_ms.compare_exchange(
+                        0,
+                        now_ms.max(1),
+                        Relaxed,
+                        Relaxed,
+                    ) {
+                        Ok(_) => now_ms.max(1),
+                        Err(prev) => prev,
+                    };
+                    Duration::from_millis(now_ms.saturating_sub(last_rx.max(bs)))
+                } else {
+                    c_mon.busy_since_ms.store(0, Relaxed);
+                    Duration::from_millis(now_ms.saturating_sub(last_rx))
+                };
                 if busy && quiet >= CARRIER_PING_AFTER {
-                    let _ = c_mon.tx.try_send(encode_frame(CMD_PING, 0, &[]));
+                    c_mon.ping_pending.store(true, Relaxed);
                 }
                 let limit = if busy { CARRIER_STALL } else { CARRIER_IDLE_DEAD };
                 if quiet >= limit {
@@ -705,6 +753,7 @@ impl MuxCarrier {
                 Vec::new()
             },
             proof,
+            token: owner.resume_token,
         };
         if self
             .tx
@@ -712,18 +761,21 @@ impl MuxCarrier {
             .await
             .is_err()
         {
-            let mut st = self.state.lock().unwrap();
-            st.pending_attach.remove(&owner.session_id);
-            st.resumable_owners.remove(&owner.session_id);
+            {
+                let mut st = self.state.lock().unwrap();
+                st.pending_attach.remove(&owner.session_id);
+                st.resumable_owners.remove(&owner.session_id);
+            }
+            self.mark_dead();
             bail!("failed to send AttachReq");
         }
 
-        match timeout(Duration::from_secs(10), ack_rx).await {
+        match timeout(Duration::from_secs(20), ack_rx).await {
             Ok(Ok((true, peer_ack_seq))) => {
                 let (r_tx, mut r_rx) = mpsc::channel::<ResumeFrame>(STREAM_CHAN_CAP);
                 let tx_fwd = self.tx.clone();
-                let c_weak = Arc::downgrade(self);
-                let sid = owner.session_id;
+                let owner_fwd = owner.clone();
+                let tx_id = r_tx.clone();
                 tokio::spawn(async move {
                     while let Some(rf) = r_rx.recv().await {
                         if tx_fwd
@@ -731,11 +783,12 @@ impl MuxCarrier {
                             .await
                             .is_err()
                         {
+                            // Must not remove the session from resumable_owners: this task
+                            // also exits when a newer attach replaces r_tx, and deleting
+                            // the owner then black-holed SeqData after resume (bulk = 0 bytes).
+                            owner_fwd.detach_if_same_sender(&tx_id);
                             break;
                         }
-                    }
-                    if let Some(c) = c_weak.upgrade() {
-                        c.state.lock().unwrap().resumable_owners.remove(&sid);
                     }
                 });
                 owner.reattach_carrier(epoch, peer_ack_seq, r_tx).await?;
@@ -832,8 +885,9 @@ impl MuxCarrier {
                 MuxOpenResult::Refused
             }
             _ => {
+                // One slow SYN must not kill every resumable session on this carrier.
                 self.remove_stream(sid);
-                self.mark_dead();
+                let _ = self.tx.try_send(encode_frame(CMD_RST, sid, &[]));
                 MuxOpenResult::CarrierDead
             }
         }
@@ -852,14 +906,17 @@ async fn closed_rd_wait(rx: &mut watch::Receiver<bool>) {
 /// Turbo-Tunnel `SessionOwner` streams, enforcing anti-SSRF destination validation.
 pub async fn serve_exit(link: Link, allow_private: bool) -> Result<()> {
     let reg = Arc::new(SessionRegistry::new());
-    serve_exit_with_registry(link, allow_private, reg).await
+    // No local static public available: resume AttachReq will be rejected (proof_binding empty).
+    serve_exit_with_registry(link, allow_private, reg, Vec::new()).await
 }
 
 pub async fn serve_exit_with_registry(
     link: Link,
     allow_private: bool,
     session_reg: Arc<SessionRegistry>,
+    local_static_pub: Vec<u8>,
 ) -> Result<()> {
+    let peer_pub = link.peer_pub().unwrap_or_default().to_vec();
     let (mut lr, mut lw) = link.split();
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CARRIER_TX_CAP);
     let streams: Arc<StdMutex<HashMap<u32, mpsc::Sender<StreamRx>>>> =
@@ -872,22 +929,26 @@ pub async fn serve_exit_with_registry(
         let mut sent_rekey = false;
         while let Some(frame) = rx.recv().await {
             let flen = frame.len() as u64;
-            if lw.send(&frame).await.is_err() {
+            if !matches!(timeout(CARRIER_WRITE_TIMEOUT, lw.send(&frame)).await, Ok(Ok(()))) {
                 break;
             }
             let tot = b_wr.fetch_add(flen, Relaxed) + flen;
             if !sent_rekey && (tot >= REKEY_MAX_BYTES || started.elapsed() >= REKEY_MAX_AGE) {
                 sent_rekey = true;
                 stats::REKEY_ROTATIONS.fetch_add(1, Relaxed);
-                let _ = lw.send(&encode_frame(CMD_REKEY, 0, &[])).await;
+                let _ = timeout(
+                    CARRIER_WRITE_TIMEOUT,
+                    lw.send(&encode_frame(CMD_REKEY, 0, &[])),
+                )
+                .await;
             }
         }
     });
 
     let mut plain = vec![0u8; CHUNK + 64];
     loop {
-        let n = match lr.recv_into(&mut plain).await {
-            Ok(n) if n >= MUX_HDR_LEN => n,
+        let n = match timeout(EXIT_CARRIER_IDLE_TIMEOUT, lr.recv_into(&mut plain)).await {
+            Ok(Ok(n)) if n >= MUX_HDR_LEN => n,
             _ => break,
         };
         bytes_total.fetch_add(n as u64, Relaxed);
@@ -955,7 +1016,37 @@ pub async fn serve_exit_with_registry(
                             last_ack_seq,
                             target_addr,
                             proof,
+                            token,
                         } => {
+                            let existing = session_reg.get(&session_id);
+                            let binding = existing.as_ref().map(|e| {
+                                (
+                                    e.resume_token,
+                                    e.peer_noise_pub.clone(),
+                                    e.closed.load(Relaxed),
+                                )
+                            });
+                            // proof_binding = Exit static public (same key Entry mixed into HMAC).
+                            // noise_peer = authenticated Entry static public on this carrier.
+                            let authorized = authorize_attach(
+                                &local_static_pub,
+                                &peer_pub,
+                                &token,
+                                &session_id,
+                                epoch,
+                                &proof,
+                                binding.as_ref().map(|(t, p, c)| (t.as_slice(), p.as_slice(), *c)),
+                            );
+                            if authorized.is_err() {
+                                let rej = ResumeFrame::AttachAck {
+                                    session_id,
+                                    epoch,
+                                    peer_ack_seq: 0,
+                                    accepted: false,
+                                };
+                                let _ = tx.try_send(encode_frame(CMD_RESUME, 0, &rej.encode()));
+                                continue;
+                            }
                             let ledger_ok = session_reg
                                 .ledger()
                                 .validate_and_record(&session_id, epoch, &proof)
@@ -970,34 +1061,61 @@ pub async fn serve_exit_with_registry(
                                 let _ = tx.try_send(encode_frame(CMD_RESUME, 0, &rej.encode()));
                                 continue;
                             }
-                            if let Some(existing) = session_reg.get(&session_id) {
-                                let (r_tx, mut r_rx) = mpsc::channel::<ResumeFrame>(STREAM_CHAN_CAP);
-                                let tx_fwd = tx.clone();
+                            if authorized.unwrap() {
+                                let Some(existing) = existing else {
+                                    continue;
+                                };
+                                let tx_re = tx.clone();
                                 tokio::spawn(async move {
-                                    while let Some(rf) = r_rx.recv().await {
-                                        if tx_fwd
-                                            .send(encode_frame(CMD_RESUME, 0, &rf.encode()))
-                                            .await
-                                            .is_err()
-                                        {
-                                            break;
+                                    let (r_tx, mut r_rx) =
+                                        mpsc::channel::<ResumeFrame>(STREAM_CHAN_CAP);
+                                    let tx_fwd = tx_re.clone();
+                                    let owner_fwd = existing.clone();
+                                    let tx_id = r_tx.clone();
+                                    tokio::spawn(async move {
+                                        while let Some(rf) = r_rx.recv().await {
+                                            if tx_fwd
+                                                .send(encode_frame(CMD_RESUME, 0, &rf.encode()))
+                                                .await
+                                                .is_err()
+                                            {
+                                                owner_fwd.detach_if_same_sender(&tx_id);
+                                                break;
+                                            }
                                         }
+                                    });
+                                    let peer_ack =
+                                        existing.dataplane.lock().unwrap().current_ack();
+                                    let ack_msg = ResumeFrame::AttachAck {
+                                        session_id,
+                                        epoch,
+                                        peer_ack_seq: peer_ack,
+                                        accepted: true,
+                                    };
+                                    if matches!(
+                                        timeout(
+                                            Duration::from_secs(5),
+                                            tx_re.send(encode_frame(
+                                                CMD_RESUME,
+                                                0,
+                                                &ack_msg.encode(),
+                                            )),
+                                        )
+                                        .await,
+                                        Ok(Ok(()))
+                                    ) {
+                                        let _ = existing
+                                            .reattach_carrier(epoch, last_ack_seq, r_tx)
+                                            .await;
                                     }
                                 });
-                                let peer_ack = existing.dataplane.lock().unwrap().current_ack();
-                                let ack_msg = ResumeFrame::AttachAck {
-                                    session_id,
-                                    epoch,
-                                    peer_ack_seq: peer_ack,
-                                    accepted: true,
-                                };
-                                let _ = tx.try_send(encode_frame(CMD_RESUME, 0, &ack_msg.encode()));
-                                let _ = existing.reattach_carrier(epoch, last_ack_seq, r_tx).await;
                             } else {
                                 let tx_init = tx.clone();
                                 let reg_c = session_reg.clone();
+                                let peer_pub_c = peer_pub.clone();
+                                let token_c = token;
                                 tokio::spawn(async move {
-                                    let target = match timeout(Duration::from_secs(10), async {
+                                    let target = match timeout(Duration::from_secs(12), async {
                                         let (host, port, _) = parse_addr(&target_addr)?;
                                         let addrs =
                                             resolve_validated(&host, port, allow_private, DNS_TIMEOUT)
@@ -1030,8 +1148,8 @@ pub async fn serve_exit_with_registry(
                                         mpsc::channel::<Vec<u8>>(STREAM_CHAN_CAP);
                                     let owner = SessionOwner::with_id_and_token(
                                         session_id,
-                                        [0u8; 32],
-                                        vec![],
+                                        token_c,
+                                        peer_pub_c,
                                         target_addr,
                                         to_sock_tx,
                                     );
@@ -1040,6 +1158,8 @@ pub async fn serve_exit_with_registry(
                                     }
                                     let (r_tx, mut r_rx) = mpsc::channel::<ResumeFrame>(STREAM_CHAN_CAP);
                                     let tx_fwd = tx_init.clone();
+                                    let owner_fwd = owner.clone();
+                                    let tx_id = r_tx.clone();
                                     tokio::spawn(async move {
                                         while let Some(rf) = r_rx.recv().await {
                                             if tx_fwd
@@ -1047,6 +1167,7 @@ pub async fn serve_exit_with_registry(
                                                 .await
                                                 .is_err()
                                             {
+                                                owner_fwd.detach_if_same_sender(&tx_id);
                                                 break;
                                             }
                                         }
@@ -1100,6 +1221,10 @@ pub async fn serve_exit_with_registry(
                                         Ok::<(), anyhow::Error>(())
                                     };
                                     let _ = join_half_closed(up, down).await;
+                                    // Keep session alive until final data + in-band FIN are ACKed
+                                    // (bounded by DEFAULT_SESSION_DETACH_TTL) so carrier loss at
+                                    // tail of a response can still resume and deliver EOF cleanly.
+                                    owner.wait_drained(DEFAULT_SESSION_DETACH_TTL).await;
                                     owner.close();
                                     reg_c.remove(&session_id);
                                 });
@@ -1113,21 +1238,15 @@ pub async fn serve_exit_with_registry(
                             payload,
                         } => {
                             if let Some(ow) = session_reg.get(&session_id) {
-                                let tx_ack = tx.clone();
-                                tokio::spawn(async move {
-                                    if let Ok(new_ack) =
-                                        ow.deliver_from_carrier(epoch, seq, ack, payload).await
-                                    {
-                                        let ack_f = ResumeFrame::SeqAck {
-                                            session_id,
-                                            epoch,
-                                            ack: new_ack,
-                                        };
-                                        let _ = tx_ack
-                                            .send(encode_frame(CMD_RESUME, 0, &ack_f.encode()))
-                                                    .await;
-                                    }
-                                });
+                                if let Ok(Some(ack_f)) =
+                                    ow.enqueue_from_carrier(epoch, seq, ack, payload)
+                                {
+                                    let _ = tx.try_send(encode_frame(
+                                        CMD_RESUME,
+                                        0,
+                                        &ack_f.encode(),
+                                    ));
+                                }
                             }
                         }
                         ResumeFrame::SeqAck {
@@ -1135,6 +1254,16 @@ pub async fn serve_exit_with_registry(
                         } => {
                             if let Some(ow) = session_reg.get(&session_id) {
                                 ow.apply_ack(ack);
+                            }
+                        }
+                        ResumeFrame::SeqSack {
+                            session_id,
+                            ack,
+                            ranges,
+                            ..
+                        } => {
+                            if let Some(ow) = session_reg.get(&session_id) {
+                                ow.apply_sack(ack, &ranges);
                             }
                         }
                         ResumeFrame::SeqFin { session_id, .. } => {
@@ -1152,6 +1281,7 @@ pub async fn serve_exit_with_registry(
 
     streams.lock().unwrap().clear();
     drop(tx);
+    writer.abort();
     let _ = writer.await;
     Ok(())
 }

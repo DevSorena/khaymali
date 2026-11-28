@@ -36,6 +36,18 @@ REPORT="$OUT/server_verify_report.txt"
 : > "$REPORT"
 ulimit -n 65535 2>/dev/null || true
 
+# sudo resets PATH and hides rustup's cargo — put it back.
+for d in "$HOME/.cargo/bin" /root/.cargo/bin; do
+  [ -d "$d" ] && case ":$PATH:" in *":$d:"*) ;; *) PATH="$d:$PATH" ;; esac
+done
+if [ -n "${SUDO_USER:-}" ]; then
+  SUDO_HOME=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)
+  if [ -n "${SUDO_HOME:-}" ] && [ -d "$SUDO_HOME/.cargo/bin" ]; then
+    case ":$PATH:" in *":$SUDO_HOME/.cargo/bin:"*) ;; *) PATH="$SUDO_HOME/.cargo/bin:$PATH" ;; esac
+  fi
+fi
+export PATH
+
 if [ -t 1 ]; then G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; Z=$'\e[0m'; else G=""; R=""; Y=""; Z=""; fi
 NP=0; NF=0; NS=0
 say()  { printf '%s\n' "$*" | tee -a "$REPORT"; }
@@ -147,20 +159,22 @@ say ""; say "--- 3. root-only features: netns/tc, GRE/FOU, nft, WireGuard, raw s
 if [ $IS_ROOT = 1 ]; then
   step doctor 120 "$BIN" doctor
   if have ip && have tc; then
-    step netns-veth-netem 120 bash -c '
-      set -e; N="$1"
-      trap "ip netns del $N 2>/dev/null; ip link del vk$N 2>/dev/null" EXIT
-      ip netns add "$N"
-      ip link add "vk$N" type veth peer name "vp$N"
-      ip link set "vp$N" netns "$N"
-      ip addr add 10.99.250.1/30 dev "vk$N"; ip link set "vk$N" up
-      ip netns exec "$N" ip addr add 10.99.250.2/30 dev "vp$N"
-      ip netns exec "$N" ip link set "vp$N" up; ip netns exec "$N" ip link set lo up
-      ping -c 2 -W 2 10.99.250.2 >/dev/null
-      tc qdisc add dev "vk$N" root netem delay 40ms loss 5%
-      tc qdisc show dev "vk$N" | grep -q netem
-    ' _ "$((RANDOM % 90000 + 1000))"
-    step netem-suite 3600 bash tests/netem.sh "$BIN"
+    _nlog="$OUT/logs/netns-veth-netem.log"
+    _nt0=$(date +%s)
+    timeout 120 bash scripts/netns_veth_check.sh >"$_nlog" 2>&1; _nrc=$?
+    if [ "$_nrc" -eq 0 ]; then
+      rec PASS netns-veth-netem "($(( $(date +%s) - _nt0 ))s)"
+      step netem-suite 3600 bash tests/netem.sh "$BIN"
+    elif [ "$_nrc" -eq 77 ]; then
+      skip netns-veth-netem "kernel lacks sch_netem (log: $_nlog)"
+      skip netem-suite "kernel lacks sch_netem"
+    elif [ "$_nrc" -eq 124 ]; then
+      rec FAIL netns-veth-netem "timeout after 120s  log: $_nlog"
+      skip netem-suite "netns-veth-netem timed out"
+    else
+      rec FAIL netns-veth-netem "exit $_nrc  log: $_nlog ; last: $(tail -n 1 "$_nlog" | cut -c1-100)"
+      step netem-suite 3600 bash tests/netem.sh "$BIN"
+    fi
   else
     skip netns-veth-netem "ip/tc (iproute2) missing"; skip netem-suite "ip/tc missing"
   fi

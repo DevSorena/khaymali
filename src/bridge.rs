@@ -45,13 +45,13 @@ pub async fn run(cfg: BridgeCfg) -> Result<()> {
         Arc::new(AutoTransport {
             camo: cfg.camo.clone(),
             udp_auth_key,
-            connect_timeout: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(20),
         })
     } else {
         match &cfg.camo {
             Some(c) => Arc::new(CamoTransport {
                 cfg: c.clone(),
-                connect_timeout: Duration::from_secs(10),
+                connect_timeout: Duration::from_secs(20),
             }),
             None => Arc::new(TcpTransport {
                 connect_timeout: Duration::from_secs(10),
@@ -183,16 +183,25 @@ async fn once(
         (t.connect_timeout, t.handshake_timeout)
     });
     let mut stage = Stage::Connect;
+    // Floor timeouts so adaptive shrinking never creates a handshake timeout death spiral
+    // on high-latency / lossy Camo paths.
+    let entry_ct = ct.max(Duration::from_secs(15));
+    let entry_ht = ht.max(Duration::from_secs(12));
+    let exit_ct = if cfg.camo.is_some() {
+        ct.max(Duration::from_secs(20))
+    } else {
+        ct.max(Duration::from_secs(15))
+    };
     let setup = async {
-        let mut e = timeout(ct, TcpStream::connect(&cfg.entry)).await??;
+        let mut e = timeout(entry_ct, TcpStream::connect(&cfg.entry)).await??;
         stage = Stage::Handshake;
         link::tune(&e);
         let (hs_hash, cb_secret) =
-            timeout(ht, link::auth_initiate(&mut e, &cfg.key, &cfg.entry_pub)).await??;
+            timeout(entry_ht, link::auth_initiate(&mut e, &cfg.key, &cfg.entry_pub)).await??;
         let keys = transport::derive_channel_binding_keys(&hs_hash, &cb_secret);
         let bound_e = transport::wrap_bound_stream(Box::new(e), keys.b2e, keys.e2b);
         stage = Stage::Connect;
-        let (exit_addr, x) = connect_exit(exits, tx_impl, adaptive, ct).await?;
+        let (exit_addr, x) = connect_exit(exits, tx_impl, adaptive, exit_ct).await?;
         Ok::<_, anyhow::Error>((bound_e, exit_addr, x))
     }
     .await;

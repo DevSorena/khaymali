@@ -30,6 +30,7 @@ pub static MUX_CARRIERS_ACTIVE: AtomicI64 = AtomicI64::new(0);
 pub static MUX_STREAMS_OPENED: AtomicU64 = AtomicU64::new(0);
 pub static RESUMABLE_SESSIONS_ACTIVE: AtomicI64 = AtomicI64::new(0);
 pub static SESSIONS_RESUMED: AtomicU64 = AtomicU64::new(0);
+pub static SESSION_RETRANSMITS: AtomicU64 = AtomicU64::new(0);
 pub static L3_PACKETS_TX: AtomicU64 = AtomicU64::new(0);
 pub static L3_PACKETS_RX: AtomicU64 = AtomicU64::new(0);
 pub static REKEY_ROTATIONS: AtomicU64 = AtomicU64::new(0);
@@ -201,6 +202,7 @@ pub fn render(exits: Option<&Exits>) -> String {
     line("mux_streams_opened_total", MUX_STREAMS_OPENED.load(Relaxed) as i64);
     line("resumable_sessions_active", RESUMABLE_SESSIONS_ACTIVE.load(Relaxed));
     line("sessions_resumed_total", SESSIONS_RESUMED.load(Relaxed) as i64);
+    line("session_retransmits_total", SESSION_RETRANSMITS.load(Relaxed) as i64);
     line("l3_packets_tx_total", L3_PACKETS_TX.load(Relaxed) as i64);
     line("l3_packets_rx_total", L3_PACKETS_RX.load(Relaxed) as i64);
     line("rekey_rotations_total", REKEY_ROTATIONS.load(Relaxed) as i64);

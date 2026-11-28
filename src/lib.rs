@@ -1,7 +1,11 @@
-//! Khaymali Tunnel v0.22.0 library root.
+//! Khaymali Tunnel v0.22.7 — library root.
 //!
-//! Exposes core modules for both the `khaymali` binary and real integration/negative security
-//! tests in `tests/neg_security.rs`.
+//! High-performance pure-Rust censorship-circumvention tunnel.
+//! Architecture: Entry ↔ Bridge ↔ Exit with Noise_IK end-to-end encryption.
+//! Includes hardened session resume, adaptive FEC, cluster mesh and harsh-network intelligence.
+//!
+//! This crate exposes all core modules used by the `khaymali` binary
+//! and by integration / negative-security tests.
 
 pub mod adapt;
 pub mod alerts;
@@ -9,6 +13,7 @@ pub mod autopilot;
 pub mod backup;
 pub mod bridge;
 pub mod camo;
+pub mod cli;
 pub mod carrier_swap;
 pub mod cluster_lb;
 pub mod cluster_mesh;

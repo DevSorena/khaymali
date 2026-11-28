@@ -35,6 +35,9 @@ pub struct CamoCfg {
 }
 
 const MAX_SKEW_SECS: u64 = 120;
+const CAMO_HDR_TIMEOUT: Duration = Duration::from_secs(15);
+const CAMO_BODY_TIMEOUT: Duration = Duration::from_secs(15);
+const CAMO_HS_TIMEOUT: Duration = Duration::from_secs(20);
 const FLIGHT_APPDATA: usize = 3;
 const TLS13_FINISHED_LEN: usize = 53;
 const CCS: [u8; 6] = [0x14, 3, 3, 0, 1, 1];
@@ -377,10 +380,21 @@ async fn handle_fallback(
         return;
     };
     let mut first = pre.to_vec();
+    // Plain-HTTP probes are not TLS records. Pull the rest of a short request so the
+    // decoy sees the same bytes a direct connection would (avoids truncated GET).
     if pre.len() <= 5 {
-        let mut extra = vec![0u8; 16384];
-        if let Ok(Ok(n)) = timeout(Duration::from_millis(40), c.read(&mut extra)).await {
-            first.extend_from_slice(&extra[..n]);
+        let mut extra = vec![0u8; 2048];
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while first.len() < 16 * 1024 && Instant::now() < deadline {
+            match timeout(Duration::from_millis(60), c.read(&mut extra)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => {
+                    first.extend_from_slice(&extra[..n]);
+                    if first.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
         }
     }
     let Ok(Ok(mut d)) = timeout(Duration::from_secs(5), TcpStream::connect(fb)).await else {
@@ -401,7 +415,7 @@ pub async fn server(
     fb_limiter: &Arc<FallbackLimiter>,
 ) -> Result<Option<BoxRw>> {
     let mut hdr = [0u8; 5];
-    match timeout(Duration::from_secs(10), tcp.read_exact(&mut hdr)).await {
+    match timeout(CAMO_HDR_TIMEOUT, tcp.read_exact(&mut hdr)).await {
         Ok(Ok(_)) => {}
         _ => return Ok(None),
     }
@@ -417,7 +431,7 @@ pub async fn server(
     rec.extend_from_slice(&hdr);
     let mut body = vec![0u8; len];
     let mut got = 0usize;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + CAMO_BODY_TIMEOUT;
     while got < len {
         let rem = deadline.saturating_duration_since(Instant::now());
         if rem.is_zero() {
@@ -471,12 +485,12 @@ pub async fn server(
     };
     tcp.write_all(&build_server_flight(&sid, sni_seed)).await?;
     let mut ccs = [0u8; 6];
-    timeout(Duration::from_secs(10), tcp.read_exact(&mut ccs)).await??;
+    timeout(CAMO_HS_TIMEOUT, tcp.read_exact(&mut ccs)).await??;
     if ccs != CCS {
         bail!("bad client CCS");
     }
     // Consume client TLS 1.3 Finished record (exact 53 bytes)
-    let (ft, fb) = timeout(Duration::from_secs(10), read_record(&mut tcp)).await??;
+    let (ft, fb) = timeout(CAMO_HS_TIMEOUT, read_record(&mut tcp)).await??;
     if ft != 0x17 || fb.len() != TLS13_FINISHED_LEN {
         bail!("bad client Finished record");
     }
@@ -485,7 +499,7 @@ pub async fn server(
 
 pub async fn client(mut tcp: TcpStream, cfg: &CamoCfg) -> Result<BoxRw> {
     tcp.write_all(&build_client_hello(cfg, now_unix())).await?;
-    timeout(Duration::from_secs(10), async {
+    timeout(CAMO_HS_TIMEOUT, async {
         let (t, b) = read_record(&mut tcp).await?;
         if t != 0x16 || b.first() != Some(&2) {
             bail!("camo: unexpected server hello (not a khaymali server?)");

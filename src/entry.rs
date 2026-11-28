@@ -32,10 +32,10 @@ pub const MAX_BRIDGE_HANDSHAKES: usize = 32;
 pub const MAX_BRIDGE_HS_PER_PREFIX: usize = 4;
 pub const MAX_ACTIVE_BRIDGES: usize = 256;
 pub const MAX_SOCKS_CONNS: usize = 1024;
-pub const BRIDGE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+pub const BRIDGE_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 pub const SOCKS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const DRAIN_WINDOW: Duration = Duration::from_secs(15);
-const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(3);
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Dual-cap Bridge handshake limiter: global cap + per-prefix (/64, /24) cap (SPEC §1.2, §8 Test #2).
 pub struct BridgeHandshakeLimiter {
@@ -328,7 +328,7 @@ impl MuxPool {
         adaptive: &AdaptiveRuntime,
         target_addr: &[u8],
     ) -> ResumableOpenResult {
-        for _ in 0..2 {
+        for _ in 0..4 {
             if let Some(carrier) = self.ensure_carrier(pool, cfg, direct, adaptive).await {
                 match carrier
                     .open_resumable_stream(target_addr, &self.session_reg)
@@ -352,7 +352,7 @@ impl MuxPool {
         adaptive: &AdaptiveRuntime,
         target_addr: &[u8],
     ) -> MuxOpenResult {
-        for _ in 0..2 {
+        for _ in 0..4 {
             if let Some(carrier) = self.ensure_carrier(pool, cfg, direct, adaptive).await {
                 match carrier.open_stream(target_addr).await {
                     MuxOpenResult::Opened(st) => return MuxOpenResult::Opened(st),
@@ -411,7 +411,14 @@ pub async fn run(cfg: EntryCfg) -> Result<()> {
         "bridge"
     };
     let mux_pool: Option<Arc<MuxPool>> = if cfg.mux {
-        Some(MuxPool::new(cfg.mux_carriers.max(1), session_reg.clone()))
+        let target_c = if cfg.bridge_listen.is_some() && cfg.exits.is_empty() {
+            // Pure bridge mode: leave half the bridge workers as hot-standby in LinkPool
+            // for instant carrier failover and UDP ASSOCIATE instead of starving LinkPool.
+            cfg.mux_carriers.min((cfg.pool / 2).max(1)).max(1)
+        } else {
+            cfg.mux_carriers.max(1)
+        };
+        Some(MuxPool::new(target_c, session_reg.clone()))
     } else {
         None
     };
@@ -561,13 +568,13 @@ pub async fn run(cfg: EntryCfg) -> Result<()> {
             Arc::new(AutoTransport {
                 camo: cfg.camo.clone(),
                 udp_auth_key,
-                connect_timeout: Duration::from_secs(10),
+                connect_timeout: Duration::from_secs(20),
             })
         } else {
             match &cfg.camo {
                 Some(c) => Arc::new(CamoTransport {
                     cfg: c.clone(),
-                    connect_timeout: Duration::from_secs(10),
+                    connect_timeout: Duration::from_secs(20),
                 }),
                 None => Arc::new(TcpTransport {
                     connect_timeout: Duration::from_secs(10),
@@ -700,12 +707,33 @@ pub async fn run(cfg: EntryCfg) -> Result<()> {
                     .ensure_carrier(&pool_re, &cfg_re, dir_re.as_deref(), &adp_re)
                     .await
                 {
-                    for owner in detached {
-                        let next_epoch = owner.bump_epoch();
-                        if carrier.attach_session(&owner, next_epoch, false).await.is_err() {
-                            owner.detach_carrier();
-                            break;
-                        }
+                    // Reattach detached sessions concurrently in a bounded batch so slow
+                    // handshakes do not serialize and blow the 45s detach TTL.
+                    let mut handles = Vec::with_capacity(detached.len().min(32));
+                    for owner in detached.into_iter().take(32) {
+                        let c_task = carrier.clone();
+                        let sreg_task = sreg_re.clone();
+                        handles.push(tokio::spawn(async move {
+                            let next_epoch = owner.bump_epoch();
+                            match c_task.attach_session(&owner, next_epoch, false).await {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    // Exit explicitly rejected reattach; close after 3 rejects.
+                                    if owner.note_reattach_reject() >= 3 {
+                                        owner.close();
+                                        sreg_task.remove(&owner.session_id);
+                                    } else {
+                                        owner.detach_carrier();
+                                    }
+                                }
+                                Err(_) => {
+                                    owner.detach_carrier();
+                                }
+                            }
+                        }));
+                    }
+                    for h in handles {
+                        let _ = h.await;
                     }
                 }
             }
@@ -932,13 +960,23 @@ async fn dial_once(
     t: Tuning,
 ) -> Result<Link> {
     let t0 = Instant::now();
+    let ct = if cfg.camo.is_some() {
+        t.connect_timeout.max(Duration::from_secs(15))
+    } else {
+        t.connect_timeout
+    };
+    let ht = if cfg.camo.is_some() {
+        t.handshake_timeout.max(Duration::from_secs(12))
+    } else {
+        t.handshake_timeout
+    };
     let res: std::result::Result<Link, (anyhow::Error, Stage)> = async {
-        let stream = match timeout(t.connect_timeout, tx_impl.dial(&addr)).await {
+        let stream = match timeout(ct, tx_impl.dial(&addr)).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return Err((e, Stage::Connect)),
             Err(el) => return Err((anyhow::Error::from(el), Stage::Connect)),
         };
-        match timeout(t.handshake_timeout, link::initiate(stream, &cfg.key, &cfg.exit_pub)).await {
+        match timeout(ht, link::initiate(stream, &cfg.key, &cfg.exit_pub)).await {
             Ok(Ok(l)) => Ok(l),
             Ok(Err(e)) => Err((e, Stage::Handshake)),
             Err(el) => Err((anyhow::Error::from(el), Stage::Handshake)),
@@ -1066,7 +1104,9 @@ async fn accept_bridge(
         None => Box::new(s),
     };
 
-    let lk = timeout(Duration::from_secs(10), link::initiate(stream, &cfg.key, &cfg.exit_pub))
+    // Bridge starts Exit TCP+Camo dial only after auth_respond finishes; allow enough
+    // budget for Bridge->Exit connect + Camo TLS 1.3 flight + Noise IK under lossy paths.
+    let lk = timeout(Duration::from_secs(25), link::initiate(stream, &cfg.key, &cfg.exit_pub))
         .await??
         .with_permit(active_permit);
     if !pool.push_wait(lk, ctl).await {
@@ -1135,7 +1175,7 @@ async fn acquire_inner(
         } else if let (true, Some(d)) = (allow_burst, direct) {
             if let Ok(bp) = d.burst_sem.clone().try_acquire_owned() {
                 let dialed = timeout(
-                    left.min(Duration::from_secs(8)),
+                    left.min(t.connect_timeout + t.handshake_timeout),
                     dial(&d.exits, cfg, d.tx_impl.as_ref(), adaptive),
                 )
                 .await;
@@ -1172,7 +1212,7 @@ async fn acquire_inner(
         }
         let resp_wait = deadline
             .saturating_duration_since(Instant::now())
-            .min(Duration::from_secs(10));
+            .min(Duration::from_secs(15));
         match timeout(resp_wait, lk.recv()).await {
             Ok(Ok(r)) if r == [0] => return Acquired::Link(lk),
             Ok(Ok(r)) if r == [1] => return Acquired::Refused,
@@ -1262,7 +1302,7 @@ async fn handle_socks(
             // 2. Fallback to dedicated single-stream Link
             let mut req = vec![1u8];
             req.extend_from_slice(&addr);
-            let left = overall.saturating_sub(t_open.elapsed()).max(Duration::from_millis(500));
+            let left = overall.saturating_sub(t_open.elapsed()).max(Duration::from_secs(4));
             match acquire_within(pool, cfg, direct, &adaptive, &req, Some(left)).await {
                 Acquired::Link(lk) => {
                     reply(&mut c, 0, None).await;

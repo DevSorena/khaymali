@@ -1,20 +1,82 @@
+[workspace]
+members = [
+    ".",
+    "integrations/linux-tunnel-manager",
+]
+resolver = "2"
+
 [package]
 name = "khaymali"
-version = "0.22.1"
+version = "0.22.7"
 edition = "2021"
-description = "Khaymali Tunnel v0.22.1: Entry <-> Bridge <-> Exit censorship-circumvention tunnel with Khaymali Full Tunneling Suite (WS/WSS, Bagher SSH, Spoof+WG, GRE 6to4/4in6/WSS Wraps, Auto-Dial Route, PathTest, Reverse-Path Doctor, Cluster Mesh & DNS Failover, Connectivity Rescue, Egress Bridge, 3-Layer Watchdog, Autopilot, Multi-Exit Pool, Adaptive XOR-FEC, Ktunnel, Session Resume, Noise_IK)"
+description = "Khaymali Tunnel — high-performance, pure-Rust censorship-circumvention tunnel (Entry ↔ Bridge ↔ Exit) with Noise_IK, multi-carrier autopilot, session resume, adaptive FEC, cluster mesh and harsh-network intelligence."
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/DevSorena/khaymali"
+homepage = "https://github.com/DevSorena/khaymali"
+keywords = ["tunnel", "proxy", "censorship", "noise", "vpn", "iran"]
+categories = ["network-programming", "command-line-utilities"]
+authors = ["DevSorena"]
+rust-version = "1.85"
+
+[features]
+default = ["core"]
+
+# Core tunnel functionality (always recommended)
+core = []
+
+# Advanced carrier & transport features
+cluster = []
+spoof = []
+xray = []
+ssh = []
+l3 = []
+
+# Intelligence & adaptive features
+nlp = []
+autopilot = []
+session-resume = []
+
+# Experimental / heavy features
+experimental = ["ktunnel"]
+ktunnel = []
+
+# Full suite (everything)
+full = [
+    "core",
+    "cluster",
+    "spoof",
+    "xray",
+    "ssh",
+    "l3",
+    "nlp",
+    "autopilot",
+    "session-resume",
+    "experimental",
+]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
 snow = "0.9"
 anyhow = "1"
 socket2 = { version = "0.5", features = ["all"] }
 hmac = "0.12"
 sha2 = "0.10"
 getrandom = "0.2"
+thiserror = "1"
+bytes = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"
 
 [profile.release]
 opt-level = 3
 lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = false

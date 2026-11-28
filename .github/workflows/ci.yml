@@ -46,13 +46,24 @@ jobs:
       - name: Intelligence, Doctor & NLP CLI smoke tests
         run: bash tests/intelligence_cli.sh target/release/khaymali
 
-      - name: Loopback integration suite
+      - name: Loopback integration suite (fail-closed)
         run: |
           set +e
           bash tests/integration.sh target/release/khaymali 2>&1 | tee /tmp/khaymali-integration.log
+          INT_RC=${PIPESTATUS[0]}
           set -e
-          BAD=$(grep -E "^  FAIL:" /tmp/khaymali-integration.log | grep -vc "plain-HTTP probe" || true)
-          test "$BAD" = "0"
+          PASSED=$(grep -cE "^  PASS:" /tmp/khaymali-integration.log || true)
+          TOTAL_FAIL=$(grep -cE "^  FAIL:" /tmp/khaymali-integration.log || true)
+          EXPECTED_FAIL=$(grep -E "^  FAIL:" /tmp/khaymali-integration.log | grep -c "plain-HTTP probe" || true)
+          UNEXPECTED_FAIL=$((TOTAL_FAIL - EXPECTED_FAIL))
+          printf '{"suite":"integration","exit_code":%d,"passed":%d,"failed":%d,"expected_fail":%d}\n' \
+            "$INT_RC" "$PASSED" "$UNEXPECTED_FAIL" "$EXPECTED_FAIL" | tee /tmp/khaymali-integration-summary.json
+          test "$PASSED" -gt 0
+          test "$UNEXPECTED_FAIL" -eq 0
+          if [ "$INT_RC" -ne 0 ] && [ "$EXPECTED_FAIL" -eq 0 ]; then
+            echo "integration.sh exited $INT_RC without an expected-failure marker" >&2
+            exit "$INT_RC"
+          fi
 
       - name: Adaptive engine chaos test
         run: bash tests/chaos.sh target/release/khaymali

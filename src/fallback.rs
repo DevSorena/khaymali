@@ -4,10 +4,11 @@
 use crate::stats;
 use crate::util::{ip_prefix_key, PrefixKey};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
@@ -149,6 +150,19 @@ impl FallbackLimiter {
     }
 }
 
+/// When the peer aborted (RST), close our side the same way so plain-HTTP probes
+/// cannot distinguish the tunnel from the decoy by FIN vs RST.
+fn abort_with_rst<S: AsRef<TcpStream>>(sock: &S) {
+    let _ = socket2::SockRef::from(sock.as_ref()).set_linger(Some(Duration::from_secs(0)));
+}
+
+fn is_reset(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+    )
+}
+
 /// Zero artificial timeout in normal mode; mirrors both half-close FIN directions 1:1.
 /// Closes cleanly ONLY if `lease` is evicted under saturation.
 pub async fn mirror_bidirectional(c: TcpStream, d: TcpStream, lease: &FallbackLease) {
@@ -170,8 +184,12 @@ pub async fn mirror_bidirectional(c: TcpStream, d: TcpStream, lease: &FallbackLe
                         break;
                     }
                 }
-                Err(_) => {
-                    let _ = dw.shutdown().await;
+                Err(e) => {
+                    if is_reset(&e) {
+                        abort_with_rst(&dw);
+                    } else {
+                        let _ = dw.shutdown().await;
+                    }
                     return true;
                 }
             }
@@ -194,8 +212,12 @@ pub async fn mirror_bidirectional(c: TcpStream, d: TcpStream, lease: &FallbackLe
                         break;
                     }
                 }
-                Err(_) => {
-                    let _ = cw.shutdown().await;
+                Err(e) => {
+                    if is_reset(&e) {
+                        abort_with_rst(&cw);
+                    } else {
+                        let _ = cw.shutdown().await;
+                    }
                     return true;
                 }
             }

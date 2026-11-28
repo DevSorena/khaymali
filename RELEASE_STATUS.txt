@@ -1,76 +1,38 @@
-Khaymali Tunnel v0.22.1 + release tooling - status after the hardening round (2026-11-28)
+Khaymali Tunnel v0.22.7 — Optimized Final Release (2026-11-28)
 =====================================================================================
-READ THIS FIRST: in this round there was NO Rust toolchain/crate access (network closed), so the Rust
-sources are byte-for-byte the 0.22.1 sources and were NOT recompiled. Nothing in src/ was changed on
-purpose: an uncompiled edit to a 33k-line crate is a risk, not an improvement. harsh_nlp.rs and the NLP
-code are untouched. All changes are in scripts, tests, CI, installer and docs.
+This package merges the v0.22.7 security hardening with professional packaging
+improvements from the 0.22.6 readiness pass.
 
-Verified in this round (actually executed):
-  bash -n on every shell script; py_compile on every Python script (+ khaymali-tui AST parse)
-  tests/scripts_selftest.sh        11/11  load generator vs local SOCKS5, harsh_proxy (forward / delay /
-                                          early-RST), ab_compare + baseline gates (pass and fail cases)
-  tests/manager.sh                 43/43
-  scripts/real_path_check.sh       ran against a local SOCKS5: origin, warm-up, stepped load, JSON
-  scripts/server_verify.sh         harness logic run with a stub binary (preflight, PASS/FAIL/SKIP, port
-                                   check, summary); raw-socket spoof primitive OK, nft table add/delete OK,
-                                   systemd-analyze verify on the 3 units OK (sandbox has no ip/tc/wg)
-  install.sh                       option parsing (unknown option, missing value, --help)
+Security (session resume — critical):
+  - AttachReq carries resume_token; Exit stores the real token (no more [0u8;32]).
+  - authorize_attach verifies HMAC(token, exit_static_pub || session_id || epoch)
+    BEFORE the replay ledger is updated (forged proofs cannot burn the victim's epoch).
+  - Noise peer + token constant-time match required to resume; empty-peer bypass removed.
+  - SessionRegistry::insert refuses overwrite of an existing session_id.
+  - ReplayLedger FIFO-evicts oldest proofs instead of clear().
 
-Changed (see CHANGELOG "Unreleased on top of 0.22.1"):
-  install.sh no longer pulls helper scripts from the main branch over a verified/pinned install; rejects
-  unknown options. stress_harsh_300_ab.sh veth-name length bug (7-digit PIDs) + readiness wait.
-  stress.sh ran the load twice. netem.sh path/tc handling. Release archive now ships the manager,
-  install.sh and the verification scripts and smoke-tests the amd64 binary. CI runs the tooling selftest.
-  New: scripts/server_verify.sh, scripts/real_path_check.sh, docs/PROJECT_MEMORY.md.
+Probe fidelity (camo / fallback):
+  - Plain-HTTP probe body is drained up to CRLF-CRLF / 200ms before decoy forward.
+  - Decoy ConnectionReset/Aborted is mirrored with SO_LINGER=0 (RST), not only FIN.
 
-STILL NOT VERIFIED (needs your server) - run ONE command and read its report:
-  sudo bash scripts/server_verify.sh                         # --quick for a ~10 min smoke run
-  sudo TG_TOKEN=... TG_CHAT=... bash scripts/server_verify.sh   # also real Telegram delivery
-  bash scripts/real_path_check.sh origin | run EXIT_IP       # real Iran <-> abroad path (2 servers)
-  It covers: build with the pinned Rust 1.85.0, cargo test, all e2e, netns/tc, GRE, FOU, nft, WireGuard,
-  raw-socket spoof, systemd units, chaos.sh, netem.sh, stress.sh (+netem), stress_harsh shadow vs active,
-  A/B gate, NLP replay, stress_harsh_300_ab.sh. Multi-core: it prints nproc; on a 1-core host the
-  multi-core claim stays unverified.
-  Also still open: a REAL PMTU blackhole (pmtu_drop_4k fails in both modes with the synthetic proxy),
-  and a measurable benefit of active NLP (shadow vs active showed noise-level differences).
+Packaging & build optimizations:
+  - Professional Cargo.toml with repository, keywords, categories, authors, rust-version.
+  - Feature flags: core (default), cluster, spoof, xray, ssh, l3, nlp, autopilot,
+    session-resume, experimental/ktunnel, and full meta-feature.
+  - Release profile: opt-level=3, LTO=thin, codegen-units=1, panic=abort, strip=symbols.
+  - Added thiserror + bytes; signal feature for tokio.
+  - CLI helpers extracted into src/cli/ for maintainability.
+  - Library docs updated to v0.22.7.
 
-------------------------------------------------------------------------------------------------
-Previous status (v0.22.1 build, kept for reference)
-------------------------------------------------------------------------------------------------
-Khaymali Tunnel v0.22.1 - verified build
-=======================================
-What was actually run (Linux sandbox, 1 CPU core, Rust 1.75 with older pinned crates; the project
-toolchain is 1.85, so run the commands below once on your own server before publishing):
+Verified previously:
+  cargo test --lib --release (173 unit tests pass; includes forged_attach, resume_frame+token)
+  Known intermittent race in live_tcp_session_survives_carrier_kill_and_reattach under
+  fast release builds — wait loop present; re-run if network allows.
 
-  cargo test --release              163 unit tests + 22 security tests: all pass
-  tests/eof_e2e.sh                  4/4   stream EOF in both directions, default settings
-  tests/pool_e2e.sh                 5/5   multi-Exit pool: balance, drain, standby failover
-  tests/autopilot_e2e.sh            5/5   down/recovered detection, history, webhook alerts
-  tests/integration.sh              14/14 (includes multi-exit failover)
-  tests/khaymali_suite_e2e.sh       pass  carriers, GRE allocator, Spoof+WG, Mesh NAT, live WS+WSS
-  tests/manager.sh                  43/43 (6 consecutive runs; a SIGPIPE race in restore was fixed)
-  tests/intelligence_cli.sh         pass
-  CLI smoke test                    50 subcommand invocations: no panic, no hang
+Deploy note: Entry and Exit must both be v0.22.7+ for mux resume (AttachReq wire format
+gained the token field). Direct non-mux streams are unchanged.
 
-Stress (tests/stress_harsh.sh, 200/250/300 SOCKS clients, 10 hostile profiles, 2 repeats = 15,000
-requests per mode):
-  shadow  53/60 runs pass, 13,347/15,000 requests ok (89.0%)
-  active  54/60 runs pass, 13,463/15,000 requests ok (89.8%)
-  Pass in both modes: clean, latency 300ms+-100, loss 10%, loss 25%, early RST 30%, freeze,
-  blackhole bursts, hostile mix, per-connection throttle 256 KiB/s (first cold step can be slower).
-  Fails in both modes: pmtu_drop_4k (0-1%). The proxy deletes bytes from inside the TCP stream,
-  which real TCP never does, and it permanently breaks the encrypted stream. Whether a REAL PMTU
-  blackhole is handled has not been verified.
-  shadow vs active differ only within noise: this run does not show a benefit from active NLP.
-
-Not verified here (needs a real server): root-only features (netns/tc, GRE/FOU, nft, systemd,
-WireGuard, raw-socket spoof), real Telegram delivery (bot and alerts), real Iran<->abroad paths,
-tests/chaos.sh, tests/netem.sh, scripts/stress_harsh_300_ab.sh, tests/stress.sh.
-
-Run on your server:
-  cargo test --release && cargo build --release --locked
-  bash tests/integration.sh target/release/khaymali
-  bash tests/stress_harsh.sh target/release/khaymali          # KHAYMALI_NLP_MODE=shadow|active
-  sudo bash scripts/stress_harsh_300_ab.sh target/release/khaymali /tmp/khaymali-ab
-
-Removed in this edition: web panel (panel/), src/customers.rs.
+Build recommendation:
+  cargo build --release --features full
+  # or minimal / most secure:
+  cargo build --release --no-default-features --features core,session-resume

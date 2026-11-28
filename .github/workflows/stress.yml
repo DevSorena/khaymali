@@ -35,26 +35,62 @@ jobs:
           ulimit -n 65535 || true
           sudo sysctl -w net.core.somaxconn=4096 net.ipv4.tcp_max_syn_backlog=8192 net.ipv4.ip_local_port_range="10240 65000" || true
       - name: Shadow run
+        id: shadow
         continue-on-error: true
         env:
           KHAYMALI_STEPS: ${{ inputs.steps || '200 250 300' }}
           REPEATS: ${{ inputs.repeats || '3' }}
         run: OUT=/tmp/khaymali-shadow POOL=48 KHAYMALI_NLP_MODE=shadow bash tests/stress_harsh.sh target/release/khaymali
       - name: Active run
+        id: active
         continue-on-error: true
         env:
           KHAYMALI_STEPS: ${{ inputs.steps || '200 250 300' }}
           REPEATS: ${{ inputs.repeats || '3' }}
         run: OUT=/tmp/khaymali-active POOL=48 KHAYMALI_NLP_MODE=active bash tests/stress_harsh.sh target/release/khaymali
-      - name: A/B gate
+      - name: A/B gate & completeness check
+        id: ab_gate
+        env:
+          SHADOW_OUTCOME: ${{ steps.shadow.outcome }}
+          ACTIVE_OUTCOME: ${{ steps.active.outcome }}
         run: |
-          python3 scripts/ab_compare.py /tmp/khaymali-shadow /tmp/khaymali-active --json /tmp/ab.json | tee /tmp/ab.txt
-          echo '```' >> "$GITHUB_STEP_SUMMARY"; cat /tmp/ab.txt >> "$GITHUB_STEP_SUMMARY"; echo '```' >> "$GITHUB_STEP_SUMMARY"
+          STATUS="PASS"
+          if [ "$SHADOW_OUTCOME" != "success" ] || [ "$ACTIVE_OUTCOME" != "success" ]; then
+            STATUS="INCOMPLETE"
+          fi
+          if [ ! -d /tmp/khaymali-shadow ] || [ ! -d /tmp/khaymali-active ]; then
+            STATUS="INCOMPLETE"
+          fi
+          AB_RC=0
+          if ls /tmp/khaymali-shadow/*.json >/dev/null 2>&1 && ls /tmp/khaymali-active/*.json >/dev/null 2>&1; then
+            python3 scripts/ab_compare.py /tmp/khaymali-shadow /tmp/khaymali-active --json /tmp/ab.json | tee /tmp/ab.txt || AB_RC=$?
+          else
+            STATUS="INCOMPLETE"
+            echo "Missing shadow/active JSON artifacts; refusing to score partial comparison." | tee /tmp/ab.txt
+          fi
+          if [ "$AB_RC" -ne 0 ] && [ "$STATUS" = "PASS" ]; then
+            STATUS="FAIL"
+          fi
+          printf '{"status":"%s","shadow":"%s","active":"%s","ab_rc":%d}\n' \
+            "$STATUS" "$SHADOW_OUTCOME" "$ACTIVE_OUTCOME" "$AB_RC" | tee /tmp/stress-summary.json
+          {
+            echo "### Stress Matrix Status: **$STATUS**"
+            echo "- Shadow stage: \`$SHADOW_OUTCOME\`"
+            echo "- Active stage: \`$ACTIVE_OUTCOME\`"
+            echo '```'
+            cat /tmp/ab.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "$STATUS" = "PASS"
       - name: Replay audit + annotation sample
         if: always()
         run: |
-          python3 scripts/eval_nlp_replay.py target/release/khaymali /tmp/khaymali-active/replay_dataset.jsonl | tee /tmp/replay.txt || true
-          python3 scripts/make_annotation_set.py /tmp/khaymali-active/replay_dataset.jsonl /tmp/annotate.tsv || true
+          if [ -s /tmp/khaymali-active/replay_dataset.jsonl ]; then
+            python3 scripts/eval_nlp_replay.py target/release/khaymali /tmp/khaymali-active/replay_dataset.jsonl | tee /tmp/replay.txt
+            python3 scripts/make_annotation_set.py /tmp/khaymali-active/replay_dataset.jsonl /tmp/annotate.tsv
+          else
+            echo "INCOMPLETE: /tmp/khaymali-active/replay_dataset.jsonl missing or empty" | tee /tmp/replay.txt
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -63,6 +99,7 @@ jobs:
             /tmp/khaymali-shadow/*.json
             /tmp/khaymali-active/*.json
             /tmp/khaymali-active/replay_dataset.jsonl
+            /tmp/stress-summary.json
             /tmp/ab.json
             /tmp/ab.txt
             /tmp/replay.txt

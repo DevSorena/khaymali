@@ -1,3 +1,26 @@
+## v0.22.7 (2026-11-28)
+
+### Security
+- **Resume AttachReq is now cryptographically enforced**: Exit verifies `HMAC(token, exit_static_pub || session_id || epoch)` *before* touching the replay ledger; forged proofs no longer burn the victim's epoch.
+- **Resume token is carried in AttachReq and stored on Exit** (no more all-zero token); reattach requires constant-time token + Noise peer match.
+- **Empty `peer_noise_pub` bypass removed**; cross-peer session hijack via known `session_id` is rejected.
+- **`SessionRegistry::insert` refuses overwrite** of an existing `session_id`.
+- **ReplayLedger no longer `clear()`s** under capacity pressure; it evicts oldest proofs FIFO.
+
+### Reliability
+- **Fallback mirror propagates RST** (`SO_LINGER=0`) when the decoy resets, closing the plain-HTTP probe gap (FIN vs RST distinguishability).
+- **Camo fallback reads a complete short HTTP request** (up to 200ms / CRLF-CRLF) before forwarding to the decoy.
+
+## v0.22.6 (2026-11-28)
+
+### Highlights
+- **RFC 6675 SACK Recovery Episode (`src/session_resume.rs`)**: Added `recovery_point` lifecycle (`in_recovery()`, `recovery_point()`, `has_unacked()`) on top of `SeqSack` (`0x15`), Jacobson/Karels RTO, and `IsLost` multi-hole recovery.
+- **Zero-Reordering Inbound Data-Plane (`src/session_resume.rs`, `src/mux.rs`)**: Replaced per-frame `tokio::spawn(deliver_from_carrier)` with synchronous wire-order `enqueue_from_carrier()` + single per-session FIFO drainer, eliminating multi-core LIFO reordering and `ooo_recv` overflow under bursty TCP loss recovery (`loss5` bulk download).
+- **Immediate Unblock on Close & Clean Exit Drain (`src/session_resume.rs`, `src/mux.rs`)**: Made `SessionOwner::to_socket_tx` droppable in `close()` with `wait_closed()` / `wait_drained()`, added 60s Exit carrier idle timeout + writer abort, bounded live/replay sends (5s / 15s), and fixed `MuxCarrier` stall monitor idle-to-busy false kills (`busy_since_ms`).
+- **Session Peer-Key Binding (`src/mux.rs`)**: Bound Exit `SessionOwner` instances to the authenticated Noise static key (`peer_pub`) so another peer cannot hijack an existing `session_id` on reattach.
+- **Bridge + Camo Loss Resilience (`src/camo.rs`, `src/bridge.rs`, `src/entry.rs`, `src/exit.rs`)**: Added adaptive timeout floors (15s connect / 12s handshake / 20s Camo & Exit respond / 25s bridge `link::initiate`), reserved half of pure-bridge workers in `LinkPool` for instant failover, and made Resume Supervisor reattach sessions concurrently in bounded batches (closing after 3 explicit rejects).
+- **Verification & CI/Release Hardening (`scripts/netns_veth_check.sh`, `scripts/server_verify.sh`, `.github/workflows/*`, `install.sh`)**: Added standalone diagnostic `netns_veth_check.sh` (exit `77` -> `SKIP` when `sch_netem` is absent), fail-closed CI integration and stress completeness gates, job-scoped release permissions with staging audit & manifest, and full helper+binary rollback with explicit trust-state summary in `install.sh`.
+
 # Changelog
 
 All notable changes to Khaymali Tunnel are documented here. Historical version changelogs and audits (`v0.5.0` through `v0.14.0`) are preserved in [`docs/archive/`](docs/archive/).

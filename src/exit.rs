@@ -153,12 +153,12 @@ pub async fn run(cfg: ExitCfg) -> Result<()> {
             Arc::new(AutoTransport {
                 camo: cfg.camo.clone(),
                 udp_auth_key: auth_key,
-                connect_timeout: Duration::from_secs(10),
+                connect_timeout: Duration::from_secs(20),
             })
         } else if let Some(c) = cfg.camo.clone() {
             Arc::new(CamoTransport {
                 cfg: c,
-                connect_timeout: Duration::from_secs(10),
+                connect_timeout: Duration::from_secs(20),
             })
         } else {
             Arc::new(TcpTransport {
@@ -181,7 +181,7 @@ pub async fn run(cfg: ExitCfg) -> Result<()> {
             tokio::spawn(async move {
                 let mut backoff = Duration::from_millis(300);
                 while !ctl_r.is_draining() {
-                    match timeout(Duration::from_secs(10), tx_r.dial(&target_r)).await {
+                    match timeout(Duration::from_secs(20), tx_r.dial(&target_r)).await {
                         Ok(Ok(stream)) => {
                             backoff = Duration::from_millis(300);
                             stats::REVERSE_EXITS_CONNECTED.fetch_add(1, Relaxed);
@@ -417,7 +417,7 @@ async fn handle_stream(
     session_reg: &Arc<SessionRegistry>,
 ) -> Result<()> {
     let mut lk: Link =
-        timeout(Duration::from_secs(10), link::respond(stream, &cfg.key, &cfg.allowed)).await??;
+        timeout(Duration::from_secs(20), link::respond(stream, &cfg.key, &cfg.allowed)).await??;
 
     let _peer_guard = match lk.peer_pub() {
         Some(pk) => match peer_quota.acquire(pk) {
@@ -449,7 +449,20 @@ async fn handle_stream(
             }
             Some(3) => {
                 lk.send(&[0]).await?;
-                return mux::serve_exit_with_registry(lk, cfg.allow_private, session_reg.clone()).await;
+                let exit_pub = if cfg.key.len() == 32 {
+                    let mut sk = [0u8; 32];
+                    sk.copy_from_slice(&cfg.key);
+                    crate::spoof_carrier::x25519_public_from_private(&sk).to_vec()
+                } else {
+                    Vec::new()
+                };
+                return mux::serve_exit_with_registry(
+                    lk,
+                    cfg.allow_private,
+                    session_reg.clone(),
+                    exit_pub,
+                )
+                .await;
             }
             Some(4) => {
                 // Layer-3 IP TUN bridge (`[4, mode_byte]`)
@@ -502,7 +515,7 @@ async fn handle_l3_tun(mut lk: Link, _cfg: &ExitCfg, _mode: L3Mode) -> Result<()
 }
 
 async fn handle_tcp(mut lk: Link, addr: &[u8], allow_private: bool) -> Result<()> {
-    let target = match timeout(Duration::from_secs(10), connect(addr, allow_private)).await {
+    let target = match timeout(Duration::from_secs(15), connect(addr, allow_private)).await {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
             let _ = lk.send(&[1]).await;

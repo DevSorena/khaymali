@@ -26,6 +26,9 @@ REVERT_TUNE=0
 VERIFY_ATTEST=0
 ALLOW_UNVERIFIED=0
 LOG="/var/log/khaymali-install.log"
+TRUST_STATUS="unknown"
+RESOLVED_COMMIT=""
+ARTIFACT_SHA256=""
 
 MIRROR=""
 JOIN=""
@@ -63,6 +66,7 @@ die()  { printf '%s[x]%s %s\n' "$c_err" "$c_off" "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "Run as root (sudo -i, then re-run)."
 [ "$(uname -s)" = Linux ] || die "Linux only."
+touch "$LOG" 2>/dev/null && chmod 0600 "$LOG" 2>/dev/null || true
 
 if [ "$REVERT_TUNE" -eq 1 ]; then
   n=0
@@ -171,14 +175,27 @@ rollback_existing() {
 
 HELPERS_DONE=" "
 install_from_dir() {
+  local dir="$1" f installed=" "
   backup_existing
-  if ! install -m 0755 "$1/khaymali" "$PREFIX/khaymali"; then
+  if ! install -m 0755 "$dir/khaymali" "$PREFIX/khaymali"; then
     rollback_existing
     die "Failed to install khaymali binary."
   fi
   for f in khaymali-tui khaymali-manager khaymali-doctor khaymali-web; do
-    if [ -f "$1/$f" ]; then install -m 0755 "$1/$f" "$PREFIX/$f" && HELPERS_DONE="$HELPERS_DONE$f "; fi
+    if [ -f "$dir/$f" ]; then
+      if ! install -m 0755 "$dir/$f" "$PREFIX/$f"; then
+        # Roll back binary AND any newly-installed helpers so no mixed-version state remains
+        for done_f in $installed; do
+          [ -f "$BACKUP/$done_f" ] || rm -f "$PREFIX/$done_f"
+        done
+        rollback_existing
+        die "Failed to install helper $f; rolled back full previous installation."
+      fi
+      installed="$installed$f "
+      HELPERS_DONE="$HELPERS_DONE$f "
+    fi
   done
+  ARTIFACT_SHA256="$(sha256sum "$PREFIX/khaymali" | awk '{print $1}')"
   return 0
 }
 
@@ -197,6 +214,8 @@ build_from_source() {
   else
     git clone --depth 1 "https://github.com/$REPO.git" "$TMP/src"
   fi
+  RESOLVED_COMMIT="$(git -C "$TMP/src" rev-parse HEAD 2>/dev/null || true)"
+  TRUST_STATUS="source-build-locked"
   ( cd "$TMP/src" && { [ -f Cargo.lock ] || cargo generate-lockfile; } && cargo build --release --locked )
   mkdir -p "$TMP/out"
   cp "$TMP/src/target/release/khaymali" "$TMP/out/"
@@ -207,6 +226,7 @@ build_from_source() {
 }
 
 if [ -n "${KHAYMALI_BIN:-}" ]; then
+  TRUST_STATUS="local-binary"
   say "Installing local binary $KHAYMALI_BIN"
   mkdir -p "$TMP/out"
   cp "$KHAYMALI_BIN" "$TMP/out/khaymali"
@@ -225,9 +245,10 @@ else
   if fetch "$base/$asset" "$TMP/$asset"; then
     rc=0; verify_archive "$TMP/$asset" "$asset" "$base/$asset" || rc=$?
     case "$rc" in
-      0) ;;
+      0) TRUST_STATUS="checksum-verified" ;;
       1) die "Checksum mismatch - aborting." ;;
       *) if [ "$ALLOW_UNVERIFIED" -eq 1 ]; then
+           TRUST_STATUS="UNVERIFIED(--allow-unverified)"
            say "No checksum published for $asset; continuing (--allow-unverified). sha256: $(sha256sum "$TMP/$asset" | awk '{print $1}')"
          else
            say "No checksum published for $asset; falling back to a --locked source build (or pass --allow-unverified)."
@@ -241,6 +262,7 @@ else
     if [ "$VERIFY_ATTEST" -eq 1 ]; then
       need gh || die "--verify-attestation requires GitHub CLI (gh)."
       gh attestation verify "$TMP/$asset" --repo "$REPO" || die "Attestation verification failed!"
+      TRUST_STATUS="${TRUST_STATUS}+attestation-verified"
       ok "Build provenance attestation verified"
     fi
     tar -xzf "$TMP/$asset" -C "$TMP"
@@ -285,7 +307,7 @@ fi
 # the SAME ref as the binary (the pinned tag, or main for "latest") - never unverified code from
 # main on top of a pinned, checksum-verified install. Override with KHAYMALI_HELPERS_REF.
 HELPER_REF="${KHAYMALI_HELPERS_REF:-}"
-if [ -z "$HELPER_REF" ]; then if [ "$VERSION" = latest ]; then HELPER_REF=main; else HELPER_REF="$VERSION"; fi; fi
+if [ -z "$HELPER_REF" ]; then if [ -n "$RESOLVED_COMMIT" ]; then HELPER_REF="$RESOLVED_COMMIT"; elif [ "$VERSION" = latest ]; then HELPER_REF=main; else HELPER_REF="$VERSION"; fi; fi
 for f in khaymali-manager khaymali-tui; do
   case "$HELPERS_DONE" in *" $f "*) continue ;; esac
   if fetch "https://raw.githubusercontent.com/$REPO/$HELPER_REF/scripts/$f" "$TMP/$f" 2>/dev/null; then
@@ -300,6 +322,8 @@ command -v python3 >/dev/null 2>&1 || say "python3 not found: live dashboard (kh
 # this release; only the core binary is required. Never fail the install because they are absent.
 [ -x "$PREFIX/khaymali" ] || die "khaymali binary was not installed."
 ok "Installed: $("$PREFIX/khaymali" version 2>/dev/null || echo khaymali)"
+echo "  Trust status         : $TRUST_STATUS${RESOLVED_COMMIT:+ (commit ${RESOLVED_COMMIT:0:12})}"
+echo "  Binary SHA-256       : ${ARTIFACT_SHA256:-unknown}"
 echo "  Host readiness check : khaymali doctor"
 echo "  Generate keys        : khaymali keygen"
 echo "  Menu                 : khaymali-manager"
