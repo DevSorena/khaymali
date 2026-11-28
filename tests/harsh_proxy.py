@@ -8,6 +8,12 @@ Supports all KANI TinyNetNlp v4 harsh-network failure modes:
   --freeze F --freeze-at N     fraction F stall silently after N server->client bytes
   --pmtu-drop-gt N --pmtu-p P  drop/hang chunks > N bytes with prob P (small keepalives pass)
   --blackhole-every S --blackhole-for S  periodic total drop windows
+  --serial-delay               old model: sleep inside the pump (caps every connection at about
+                               16 KiB per delay, which also starves multiplexed carriers)
+
+Delay model (default, "pipelined", like tc netem): latency moves a chunk's *arrival time* only.
+Chunks stay in order and a stalled chunk (loss/RTO) holds back everything behind it, but a
+300 ms delay does not reduce throughput. A bandwidth cap (--rate) serialises transmission time.
 """
 import asyncio, argparse, random, socket, struct, sys, time
 
@@ -21,6 +27,7 @@ ap.add_argument("--freeze", type=float, default=0); ap.add_argument("--freeze-at
 ap.add_argument("--pmtu-drop-gt", type=int, default=0); ap.add_argument("--pmtu-p", type=float, default=0.5)
 ap.add_argument("--blackhole-every", type=float, default=0); ap.add_argument("--blackhole-for", type=float, default=0)
 ap.add_argument("--seed", type=int, default=1)
+ap.add_argument("--serial-delay", action="store_true")
 a = ap.parse_args()
 rnd = random.Random(a.seed)
 T0 = time.monotonic()
@@ -44,16 +51,90 @@ def hard_rst(w):
     except Exception:
         pass
 
-async def impair(n):
+def delay_ms(n):
+    """Latency + jitter + loss stall for one chunk (no bandwidth component)."""
     d = a.delay + (rnd.uniform(-a.jitter, a.jitter) if a.jitter else 0.0)
     if a.retx and rnd.random() < a.retx:
         d += a.rto * rnd.choice((1, 1, 2, 4))
+    return max(d, 0.0)
+
+async def impair(n):
+    """Old serial model: sleep in the pump."""
+    d = delay_ms(n)
     if a.rate:
         d += (n / a.rate) * 1000.0
     if d > 0:
         await asyncio.sleep(d / 1000.0)
 
 async def pipe(r, w, freeze_after=None, rst_first=False, peer=None):
+    if a.serial_delay:
+        return await pipe_serial(r, w, freeze_after, rst_first, peer)
+    # Bounded in-flight data = back-pressure like a real link: when the (rate limited) path is full
+    # the sender is slowed through TCP instead of buffering without limit (an unbounded queue keeps
+    # delivering data for clients that already gave up, and wrecks every later test step).
+    q = asyncio.Queue(maxsize=16 if a.rate else 256)
+    sent = 0
+    tx_free = 0.0          # when the (rate limited) link finishes sending the previous chunk
+    last_release = 0.0     # arrival times never go backwards: in-order delivery
+
+    async def writer():
+        try:
+            while True:
+                item = await q.get()
+                if item is None:
+                    break
+                release, data = item
+                wait = release - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                w.write(data)
+                await w.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                w.close()
+            except Exception:
+                pass
+
+    wt = asyncio.create_task(writer())
+    try:
+        while True:
+            data = await r.read(16384)
+            if not data:
+                break
+            if rst_first and sent == 0:
+                stats["rst"] += 1
+                hard_rst(peer)
+                hard_rst(w)
+                wt.cancel()
+                return
+            if a.pmtu_drop_gt > 0 and len(data) > a.pmtu_drop_gt and rnd.random() < a.pmtu_p:
+                stats["pmtu_drops"] += 1
+                await asyncio.sleep(15)
+                continue
+            if freeze_after is not None and sent + len(data) > freeze_after:
+                stats["frozen"] += 1
+                await asyncio.sleep(3600)
+            now = time.monotonic()
+            if a.rate:
+                tx_free = max(tx_free, now) + len(data) / a.rate
+                base = tx_free
+            else:
+                base = now
+            last_release = max(last_release, base + delay_ms(len(data)) / 1000.0)
+            await q.put((last_release, data))
+            sent += len(data)
+    except Exception:
+        pass
+    finally:
+        await q.put(None)
+    try:
+        await wt          # let queued chunks drain, then the writer closes the peer
+    except Exception:
+        pass
+
+async def pipe_serial(r, w, freeze_after=None, rst_first=False, peer=None):
     sent = 0
     try:
         while True:

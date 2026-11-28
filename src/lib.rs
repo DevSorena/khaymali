@@ -6,6 +6,7 @@
 pub mod adapt;
 pub mod alerts;
 pub mod autopilot;
+pub mod backup;
 pub mod bridge;
 pub mod camo;
 pub mod carrier_swap;
@@ -43,6 +44,7 @@ pub mod spoof_carrier;
 pub mod ssh_carrier;
 pub mod sshfwd;
 pub mod stats;
+pub mod tgbot;
 pub mod sysrun;
 pub mod transport;
 pub mod transport_engine;

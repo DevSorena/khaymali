@@ -73,6 +73,32 @@ fn decode_header(buf: &[u8]) -> Option<(u8, u32, &[u8])> {
     Some((cmd, sid, &buf[MUX_HDR_LEN..]))
 }
 
+/// After one direction of a resumable stream has finished (EOF), the other direction gets this
+/// long to finish before the session is torn down.
+const HALF_CLOSE_GRACE: Duration = Duration::from_secs(60);
+
+/// Run both directions of a stream. Finishes when both are done, when either fails, or when one
+/// direction has been done for `HALF_CLOSE_GRACE` and the other still has not finished.
+async fn join_half_closed<A, B>(up: A, down: B) -> Result<()>
+where
+    A: std::future::Future<Output = Result<()>>,
+    B: std::future::Future<Output = Result<()>>,
+{
+    tokio::pin!(up);
+    tokio::pin!(down);
+    let (mut up_done, mut down_done) = (false, false);
+    loop {
+        tokio::select! {
+            r = &mut up, if !up_done => { r?; up_done = true; }
+            r = &mut down, if !down_done => { r?; down_done = true; }
+            _ = sleep(HALF_CLOSE_GRACE), if up_done != down_done => return Ok(()),
+        }
+        if up_done && down_done {
+            return Ok(());
+        }
+    }
+}
+
 enum StreamRx {
     Data(Vec<u8>),
     Fin,
@@ -150,7 +176,9 @@ impl ResumableMuxStream {
                     .unwrap_or(max_chunk);
                 let n = tr.read(&mut buf[..lim]).await?;
                 if n == 0 {
-                    owner_up.close();
+                    // client finished sending: tell the exit (in order, after the data) and keep
+                    // the session open so the response can still arrive
+                    let _ = owner_up.send_fin(DEFAULT_SESSION_DETACH_TTL).await;
                     return Ok::<(), anyhow::Error>(());
                 }
                 stats::BYTES_UP.fetch_add(n as u64, Relaxed);
@@ -169,6 +197,9 @@ impl ResumableMuxStream {
 
         let down = async {
             while let Some(chunk) = self.to_socket_rx.recv().await {
+                if chunk.is_empty() {
+                    break; // in-band EOF from the exit: the target closed
+                }
                 stats::BYTES_DOWN.fetch_add(chunk.len() as u64, Relaxed);
                 transferred.fetch_add(chunk.len() as u64, Relaxed);
                 tw.write_all(&chunk).await?;
@@ -177,7 +208,7 @@ impl ResumableMuxStream {
             Ok::<(), anyhow::Error>(())
         };
 
-        let res = tokio::try_join!(up, down);
+        let res = join_half_closed(up, down).await;
         if res.is_ok() {
             if let Some(a) = adaptive {
                 a.record(
@@ -331,6 +362,15 @@ struct CarrierState {
 }
 
 /// Entry-side multiplexed carrier running over a single authenticated Noise `Link`.
+/// A carrier with work in flight that has not received a single frame for this long is treated as
+/// frozen (silent black hole, middlebox stall) and replaced; resumable sessions move to another
+/// carrier. Before this, a frozen carrier stayed "alive" forever and swallowed every stream on it.
+const CARRIER_STALL: Duration = Duration::from_secs(15);
+/// With work in flight, probe a quiet carrier after this long (any reply, even a PONG, proves life).
+const CARRIER_PING_AFTER: Duration = Duration::from_secs(4);
+/// An idle carrier is pinged every 15 s by its writer; no frame at all for this long means dead.
+const CARRIER_IDLE_DEAD: Duration = Duration::from_secs(75);
+
 pub struct MuxCarrier {
     tx: mpsc::Sender<Vec<u8>>,
     next_id: AtomicU32,
@@ -339,6 +379,8 @@ pub struct MuxCarrier {
     alive: AtomicBool,
     draining: AtomicBool,
     created: Instant,
+    /// Milliseconds since `created` at which the last frame arrived (stall detection).
+    last_rx_ms: AtomicU64,
     max_age: Duration,
     peer_pub: Vec<u8>,
     state: StdMutex<CarrierState>,
@@ -358,6 +400,7 @@ impl MuxCarrier {
             alive: AtomicBool::new(true),
             draining: AtomicBool::new(false),
             created: Instant::now(),
+            last_rx_ms: AtomicU64::new(0),
             max_age: effective_max_age,
             peer_pub,
             state: StdMutex::new(CarrierState {
@@ -373,6 +416,7 @@ impl MuxCarrier {
         // Writer task + idle CMD_PING keepalive
         let c_wr = carrier.clone();
         let closed_wr = closed_tx.clone();
+        let closed_mon = closed_tx.clone();
         tokio::spawn(async move {
             let mut sent_rekey = false;
             loop {
@@ -416,6 +460,7 @@ impl MuxCarrier {
                     }
                 };
                 c_rd.bytes_total.fetch_add(n as u64, Relaxed);
+                c_rd.last_rx_ms.store(c_rd.created.elapsed().as_millis() as u64, Relaxed);
                 let Some((cmd, sid, payload)) = decode_header(&plain[..n]) else {
                     continue;
                 };
@@ -541,6 +586,40 @@ impl MuxCarrier {
             stats::MUX_CARRIERS_ACTIVE.fetch_sub(1, Relaxed);
         });
 
+        // Stall monitor: a frozen carrier never errors, so only silence can reveal it.
+        let c_mon = carrier.clone();
+        tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(2)).await;
+                if !c_mon.alive.load(Relaxed) {
+                    break;
+                }
+                let busy = {
+                    let st = c_mon.state.lock().unwrap();
+                    !st.streams.is_empty()
+                        || !st.pending_syn.is_empty()
+                        || !st.pending_attach.is_empty()
+                        || !st.resumable_owners.is_empty()
+                };
+                let now_ms = c_mon.created.elapsed().as_millis() as u64;
+                let quiet = Duration::from_millis(now_ms.saturating_sub(c_mon.last_rx_ms.load(Relaxed)));
+                if busy && quiet >= CARRIER_PING_AFTER {
+                    let _ = c_mon.tx.try_send(encode_frame(CMD_PING, 0, &[]));
+                }
+                let limit = if busy { CARRIER_STALL } else { CARRIER_IDLE_DEAD };
+                if quiet >= limit {
+                    stats::log_err_rl(&format!(
+                        "[mux] carrier silent for {}s with {} work in flight: replacing it",
+                        quiet.as_secs(),
+                        if busy { "streams" } else { "no" }
+                    ));
+                    c_mon.mark_dead();
+                    let _ = closed_mon.send(true);
+                    break;
+                }
+            }
+        });
+
         carrier
     }
 
@@ -559,6 +638,7 @@ impl MuxCarrier {
 
     pub fn attach_resumable_owner(&self, owner: Arc<SessionOwner>) {
         let mut st = self.state.lock().unwrap();
+        st.resumable_owners.retain(|_, o| !o.closed.load(Relaxed));
         st.resumable_owners.insert(owner.session_id, owner);
     }
 
@@ -578,8 +658,13 @@ impl MuxCarrier {
             && self.active_streams.load(Relaxed) < MUX_MAX_STREAMS_PER_CARRIER
     }
 
+    /// Streams currently riding this carrier. Resumable sessions (the default) are not in
+    /// `streams`, so they are counted from `resumable_owners`; before, they counted as zero and
+    /// every new stream picked the same "least loaded" carrier, so one carrier (and one throttled
+    /// TCP connection) carried everything while the others sat idle.
     pub fn load(&self) -> usize {
-        self.active_streams.load(Relaxed)
+        let st = self.state.lock().unwrap();
+        st.streams.len() + st.resumable_owners.values().filter(|o| !o.closed.load(Relaxed)).count()
     }
 
     /// Attach or reattach a `SessionOwner` onto this live `MuxCarrier` using `CMD_RESUME`.
@@ -599,6 +684,7 @@ impl MuxCarrier {
                 bail!("mux carrier closed");
             }
             st.pending_attach.insert(owner.session_id, ack_tx);
+            st.resumable_owners.retain(|_, o| !o.closed.load(Relaxed));
             st.resumable_owners.insert(owner.session_id, owner.clone());
         }
 
@@ -979,10 +1065,16 @@ pub async fn serve_exit_with_registry(
                                     let (mut tr, mut tw) = target.into_split();
                                     let up = async {
                                         while let Some(chunk) = to_sock_rx.recv().await {
+                                            if chunk.is_empty() {
+                                                // in-band EOF: the client finished sending
+                                                let _ = tw.shutdown().await;
+                                                break;
+                                            }
                                             if tw.write_all(&chunk).await.is_err() {
                                                 break;
                                             }
                                         }
+                                        Ok::<(), anyhow::Error>(())
                                     };
                                     let down = async {
                                         let mut buf = vec![0u8; MUX_MAX_PAYLOAD.saturating_sub(64)];
@@ -998,13 +1090,16 @@ pub async fn serve_exit_with_registry(
                                                         .await
                                                         .is_err()
                                                     {
-                                                        break;
+                                                        return Ok::<(), anyhow::Error>(());
                                                     }
                                                 }
                                             }
                                         }
+                                        // target closed: pass EOF on to the entry's client
+                                        let _ = owner_sock.send_fin(DEFAULT_SESSION_DETACH_TTL).await;
+                                        Ok::<(), anyhow::Error>(())
                                     };
-                                    tokio::join!(up, down);
+                                    let _ = join_half_closed(up, down).await;
                                     owner.close();
                                     reg_c.remove(&session_id);
                                 });

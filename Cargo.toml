@@ -1,8 +1,8 @@
 [package]
 name = "khaymali"
-version = "0.21.0"
+version = "0.22.1"
 edition = "2021"
-description = "Khaymali Tunnel v0.22.0: Entry <-> Bridge <-> Exit censorship-circumvention tunnel with Khaymali Full Tunneling Suite (WS/WSS, Bagher SSH, Spoof+WG, GRE 6to4/4in6/WSS Wraps, Auto-Dial Route, PathTest, Reverse-Path Doctor, Cluster Mesh & DNS Failover, Connectivity Rescue, Egress Bridge, 3-Layer Watchdog, Autopilot, Multi-Exit Pool, Adaptive XOR-FEC, Ktunnel, Session Resume, Noise_IK)"
+description = "Khaymali Tunnel v0.22.1: Entry <-> Bridge <-> Exit censorship-circumvention tunnel with Khaymali Full Tunneling Suite (WS/WSS, Bagher SSH, Spoof+WG, GRE 6to4/4in6/WSS Wraps, Auto-Dial Route, PathTest, Reverse-Path Doctor, Cluster Mesh & DNS Failover, Connectivity Rescue, Egress Bridge, 3-Layer Watchdog, Autopilot, Multi-Exit Pool, Adaptive XOR-FEC, Ktunnel, Session Resume, Noise_IK)"
 license = "MIT"
 readme = "README.md"
 

@@ -65,7 +65,14 @@ backup_conf quiet; B="$(ls "$T"/bk/khaymali-conf-*.tar.gz | head -1)"
 t  "backup created"       test -f "$B"
 [ "$(stat -c %a "$B")" = 600 ] && ok || bad "backup mode 600"
 mkdir -p "$T/evil/etc/x"; echo hi > "$T/evil/etc/x/y"; tar -czf "$T/evil.tgz" -C "$T/evil" etc/x
-tar -tzf "$T/evil.tgz" | grep -qvE "^${CONF#/}(/|$)" && ok || bad "foreign archive detected"
+EL=$(tar -tzf "$T/evil.tgz"); grep -qvE "^${CONF#/}(/|$)" <<<"$EL" && ok || bad "foreign archive detected"
+# restore() must really refuse it (this used to depend on a SIGPIPE race)
+mkdir -p "$T/evil2/other/x"; echo hi > "$T/evil2/other/x/y"; tar -czf "$T/evil2.tgz" -C "$T/evil2" other
+restore "$T/evil2.tgz" >/dev/null 2>&1 && bad "restore refuses foreign archive" || ok
+[ -e "$T/other/x/y" ] && bad "foreign archive was NOT extracted" || ok
+mkdir -p "$T/trav/$(basename "$CONF")"; echo x > "$T/trav/f"
+tar -czf "$T/trav.tgz" --transform "s,^f,$(basename "$CONF")/../../escape," -C "$T/trav" f 2>/dev/null
+restore "$T/trav.tgz" >/dev/null 2>&1 && bad "restore refuses .. paths" || ok
 
 # tuning list only contains key=value pairs
 tune_pairs | grep -qvE '^[a-z0-9_.-]+=.+$' && bad "tune_pairs format" || ok

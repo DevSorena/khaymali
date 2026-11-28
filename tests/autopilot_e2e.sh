@@ -32,7 +32,10 @@ sleep 1
 sleep 8
 grep -q "autopilot\] on" entry.log && ok "autopilot started" || bad "autopilot started"
 kill -9 $A; echo "   TCP exit killed; whole tunnel is down"
-sleep 20
+# wait until the monitor has really seen the tunnel go down (circuit breakers need a few failed
+# dials first; a fixed sleep made this test depend on timing)
+for i in $(seq 1 60); do grep -q "no carrier is answering" entry.log && break; sleep 1; done
+grep -q "no carrier is answering" entry.log && ok "monitor noticed the tunnel is down" || bad "monitor noticed the tunnel is down"
 "$B" exit --listen 127.0.0.1:5003 --udp-listen 127.0.0.1:5002 --key "$EXSK" --allow "$ENPK" --camo-secret "$S" >exitB.log 2>&1 & PIDS="$PIDS $!"
 echo "   UDP carrier started; the pool should recover it before the 1-minute window ends"
 for i in $(seq 1 20); do grep -q "recovered" ap.state 2>/dev/null && break; sleep 3; done

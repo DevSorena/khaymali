@@ -7,6 +7,7 @@
 #   --verify-attestation   require GitHub build provenance check (`gh attestation verify`)
 #   --allow-unverified     continue when no checksum is published (default: fall back to a source build)
 # Env overrides:
+#   KHAYMALI_HELPERS_REF=ref   (ref used to fetch khaymali-manager/-tui when the archive lacks them)
 #   KHAYMALI_REPO=owner/repo   KHAYMALI_VERSION=v0.4.0 (default: latest)
 #   --join CODE            install, then configure this server as Entry from the Exit join code
 #   --join-bridge CODE     install, then configure this server as Bridge
@@ -30,6 +31,8 @@ MIRROR=""
 JOIN=""
 JOIN_BRIDGE=""
 JOIN_MODE=""
+usage() { sed -n '2,15p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//' || true; }
+need_arg() { [ "$2" -ge 2 ] || { echo "option $1 needs a value" >&2; exit 2; }; }
 while (( $# )); do
   case "$1" in
     --tune) DO_TUNE=1; shift ;;
@@ -37,15 +40,19 @@ while (( $# )); do
     --verify-attestation) VERIFY_ATTEST=1; shift ;;
     --allow-unverified) ALLOW_UNVERIFIED=1; shift ;;
     --from-source) KHAYMALI_BUILD=1; shift ;;
-    --local) KHAYMALI_BIN="$2"; shift 2 ;;
+    --local) need_arg "$1" $#; KHAYMALI_BIN="$2"; shift 2 ;;
     --local=*) KHAYMALI_BIN="${1#*=}"; shift ;;
-    --mirror) MIRROR="$2"; shift 2 ;;
+    --mirror) need_arg "$1" $#; MIRROR="$2"; shift 2 ;;
     --mirror=*) MIRROR="${1#*=}"; shift ;;
-    --join) JOIN="$2"; shift 2 ;;
+    --join) need_arg "$1" $#; JOIN="$2"; shift 2 ;;
     --join=*) JOIN="${1#*=}"; shift ;;
-    --join-bridge) JOIN_BRIDGE="$2"; shift 2 ;;
-    --mode) JOIN_MODE="$2"; shift 2 ;;
-    *) shift ;;
+    --join-bridge) need_arg "$1" $#; JOIN_BRIDGE="$2"; shift 2 ;;
+    --join-bridge=*) JOIN_BRIDGE="${1#*=}"; shift ;;
+    --mode) need_arg "$1" $#; JOIN_MODE="$2"; shift 2 ;;
+    --mode=*) JOIN_MODE="${1#*=}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    # a mistyped flag used to be ignored silently (e.g. --revert-tun would install instead of revert)
+    *) echo "unknown option: $1  (see --help)" >&2; exit 2 ;;
   esac
 done
 
@@ -162,6 +169,7 @@ rollback_existing() {
   return 0
 }
 
+HELPERS_DONE=" "
 install_from_dir() {
   backup_existing
   if ! install -m 0755 "$1/khaymali" "$PREFIX/khaymali"; then
@@ -169,7 +177,7 @@ install_from_dir() {
     die "Failed to install khaymali binary."
   fi
   for f in khaymali-tui khaymali-manager khaymali-doctor khaymali-web; do
-    if [ -f "$1/$f" ]; then install -m 0755 "$1/$f" "$PREFIX/$f"; fi
+    if [ -f "$1/$f" ]; then install -m 0755 "$1/$f" "$PREFIX/$f" && HELPERS_DONE="$HELPERS_DONE$f "; fi
   done
   return 0
 }
@@ -272,12 +280,19 @@ SYSCTL
   ok "Applied optional sysctl tuning (revert via: install.sh --revert-tune)"
 fi
 
-# always install the latest manager + TUI from main (release tarballs may carry an old/buggy menu)
+# Menu + dashboard helpers. They ship inside the verified archive / local checkout / source build;
+# those copies are used as-is. Only a helper that this run did NOT install is fetched, and then from
+# the SAME ref as the binary (the pinned tag, or main for "latest") - never unverified code from
+# main on top of a pinned, checksum-verified install. Override with KHAYMALI_HELPERS_REF.
+HELPER_REF="${KHAYMALI_HELPERS_REF:-}"
+if [ -z "$HELPER_REF" ]; then if [ "$VERSION" = latest ]; then HELPER_REF=main; else HELPER_REF="$VERSION"; fi; fi
 for f in khaymali-manager khaymali-tui; do
-  if fetch "https://raw.githubusercontent.com/$REPO/main/scripts/$f" "$TMP/$f" 2>/dev/null; then
+  case "$HELPERS_DONE" in *" $f "*) continue ;; esac
+  if fetch "https://raw.githubusercontent.com/$REPO/$HELPER_REF/scripts/$f" "$TMP/$f" 2>/dev/null; then
     sed -i 's/\r$//' "$TMP/$f"
     if [ "$f" = khaymali-manager ] && ! bash -n "$TMP/$f"; then say "downloaded $f failed syntax check; keeping existing"; continue; fi
-    install -m 0755 "$TMP/$f" "$PREFIX/$f" && ok "Installed: $f"
+    if [ "$f" = khaymali-tui ] && command -v python3 >/dev/null 2>&1 && ! python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$TMP/$f"; then say "downloaded $f failed syntax check; keeping existing"; continue; fi
+    install -m 0755 "$TMP/$f" "$PREFIX/$f" && ok "Installed: $f ($HELPER_REF)"
   fi
 done
 command -v python3 >/dev/null 2>&1 || say "python3 not found: live dashboard (khaymali-tui) needs it; the text menu works without it."

@@ -1,14 +1,27 @@
-# Khaymali Tunnel v0.22.0 · تانل خایمالی
+# Khaymali Tunnel v0.22.1 · تانل خایمالی
 
 > **تانل ضدفیلترینگ متن باز (MIT) نوشته شده با Rust، نسخه ی Pure Tunneling.** برای سرورهای ایران اکسس و شبکه های محدود ساخته شده و این امکانات رو داره: رمزنگاری سرتاسری `Noise_IK`، استتار TLS با Fallback ایزوله، فوروارد پورت لایه ۴، **Tunneling Suite** (GRE/FOU، Spoof، FRP/Backhaul، Xray، SSH، WebSocket)، **Pool و Autopilot** برای جابجایی خودکار حامل، **Cluster Mesh و Load Balancer**، و **Micro-NLP برای شبکه های سخت**.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE) [![Rust 1.75+](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](#۱۰-ساخت-از-سورس-و-تستها) [![Crypto](https://img.shields.io/badge/crypto-Noise__IK-blue.svg)](#۱-تانل-خایمالی-چیست-و-چطور-کار-میکند) [![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey.svg)](#۴-نصب-تکخطی) [![CI](https://github.com/DevSorena/khaymali/actions/workflows/ci.yml/badge.svg)](https://github.com/DevSorena/khaymali/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/DevSorena/khaymali)](https://github.com/DevSorena/khaymali/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE) [![Rust 1.85](https://img.shields.io/badge/rust-1.85-orange.svg)](#۱۰-ساخت-از-سورس-و-تستها) [![Crypto](https://img.shields.io/badge/crypto-Noise__IK-blue.svg)](#۱-تانل-خایمالی-چیست-و-چطور-کار-میکند) [![Platform](https://img.shields.io/badge/platform-Linux%20amd64%20%7C%20arm64-lightgrey.svg)](#۴-نصب-تکخطی) [![CI](https://github.com/DevSorena/khaymali/actions/workflows/ci.yml/badge.svg)](https://github.com/DevSorena/khaymali/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/DevSorena/khaymali)](https://github.com/DevSorena/khaymali/releases/latest)
 
 [راهنمای کامل فارسی](#-راهنمای-فارسی) · [English Guide](#-english-guide) · [محدودیتهای شناختهشده](#۱۱-محدودیتهای-شناختهشده-صادقانه) · [CHANGELOG](CHANGELOG.md) · [Tunneling Suite](docs/KHAYMALI_TUNNELING_SUITE.md) · [Pool & Autopilot](docs/POOL_AUTOPILOT.md) · [مستند فنی (SPEC)](docs/SPEC.md)
 
 ---
 
 # 🇮🇷 راهنمای فارسی
+
+## تازه‌های v0.22.1 (نسخه‌ی تست‌شده)
+
+این نسخه با اجرای واقعی تست استرس (۲۰۰/۲۵۰/۳۰۰ کلاینت روی ۱۰ پروفایل شبکه‌ی خصمانه) ساخته شد و این باگ‌ها که فقط زیر بار دیده می‌شدن اصلاح شدن:
+
+- **پایان اتصال (EOF) از تانل رد نمی‌شد** (حالت پیش‌فرض mux + session-resume). پاسخ‌های `Connection: close` و half-close کلاینت تا timeout آویزون می‌موندن. حالا EOF داخل همون توالی داده می‌ره.
+- **بار حامل برای جریان‌های resumable همیشه صفر بود** و همه‌ی جریان‌ها روی یک حامل جمع می‌شدن. حالا درست شمرده می‌شه و حامل‌ها با بار بیشتر (تا ۳۲) باز می‌شن و در حالت بیکار هم به تعداد تنظیم‌شده زنده می‌مونن.
+- **حامل منجمد هیچ‌وقت مرده حساب نمی‌شد.** حالا بعد از ۴ ثانیه سکوت ping و بعد از ۱۵ ثانیه سکوت کامل جایگزین می‌شه و جلسه‌ها به حامل دیگه می‌رن.
+- `khaymali-manager restore` با `tar | grep -q` زیر `pipefail` گاهی آرشیو بیگانه رو قبول می‌کرد (race با SIGPIPE). اصلاح شد و مسیرهای `..` و مطلق هم رد می‌شن.
+- خروجی دستورهای CLI وقتی به `head` یا `grep -q` پایپ می‌شد با panic و backtrace تموم می‌شد.
+- **جدید:** `khaymali backup` (پشتیبان رمزشده با AES-256-GCM و PBKDF2) و `khaymali tgbot` (کنترل از تلگرام فقط برای ادمین‌ها).
+
+نتیجه‌ی واقعی تست‌ها و محدودیت‌ها توی `RELEASE_STATUS.txt` هست.
 
 ## تازههای v0.22.0
 
@@ -300,7 +313,7 @@ khaymali diagnose "read timeout stalled at 16384 bytes"
 
 ## ۱۰. ساخت از سورس و تست‌ها
 
-پروژه با `rustc 1.75+` ساخته می‌شود و برای بیلدهای تکرارپذیر در CI و انتشار عمومی از `Cargo.lock` قفل‌شده با `--locked` استفاده می‌کند:
+پروژه با `rustc 1.85.0` (قفل‌شده در `rust-toolchain.toml`) ساخته می‌شود و برای بیلدهای تکرارپذیر در CI و انتشار عمومی از `Cargo.lock` قفل‌شده با `--locked` استفاده می‌کند:
 
 ```bash
 cargo build --release --locked
@@ -317,6 +330,17 @@ sudo NETEM=1 KHAYMALI_STEPS="200 300" bash tests/stress.sh target/release/khayma
 sudo STRESS=1 bash tests/netem.sh target/release/khaymali
 bash scripts/stress_live_300.sh 127.0.0.1:1080 http://127.0.0.1:8000/index.html 300 --json > baseline.json
 python3 scripts/check_baseline_regression.py baseline.json candidate.json
+```
+
+**همه‌ی تست‌های نیازمند سرور واقعی با یک دستور** (netns/tc، GRE/FOU، nft، WireGuard، raw-socket، systemd، تلگرام واقعی، استرس و A/B؛ هر مرحله PASS/FAIL/SKIP با دلیل):
+
+```bash
+sudo bash scripts/server_verify.sh                 # کامل
+sudo bash scripts/server_verify.sh --quick         # بدون استرس‌های طولانی
+sudo TG_TOKEN=123:ABC TG_CHAT=-100123 bash scripts/server_verify.sh   # + ارسال واقعی تلگرام
+# مسیر واقعی ایران↔خارج (دو سرور): روی Exit «origin» و روی Entry «run»
+bash scripts/real_path_check.sh origin             # سرور خارج
+bash scripts/real_path_check.sh run EXIT_IP        # سرور ایران
 ```
 
 ---

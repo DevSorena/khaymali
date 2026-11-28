@@ -1,8 +1,8 @@
 use khaymali::{
-    alerts, autopilot, bridge, camo, carrier_swap, cluster_lb, cluster_mesh, dial_route,
+    alerts, autopilot, backup, bridge, camo, carrier_swap, cluster_lb, cluster_mesh, dial_route,
     engines, entry, exit, fleet, forward, harsh_nlp, kani_nlp, l3, l3_wraps, link, node_cluster,
     ops_suite, pathtest, pool, rescue, revpath, setup_bundle, spoof_carrier, sshfwd, stats, sysrun,
-    transport, transport_engine, util, xray_engine,
+    tgbot, transport, transport_engine, util, xray_engine,
 };
 use khaymali::intelligence::{simulate_packet_twin, AdaptiveExperimentManager, CalibrationExample, DigitalTwinConfig, HardResourceBudget, NetworkSample, RiskCalibrator, TwinScenario};
 use khaymali::kani_nlp::{CandidatePromotionDecision, NetIntent, NlpAdvisor};
@@ -164,6 +164,8 @@ fn usage() {
   khaymali parse-join <JOIN_CODE>       decode a khaymali://v1?... join code into CLI flags
   khaymali status [--control SOCK]      query live status from running service control socket
   khaymali forward add|ls|rm ...        manage live port forwards on running Entry
+  khaymali tgbot --token T --admin CHAT_ID   Telegram control bot (admin chats only)
+  khaymali backup run|list|verify|restore     encrypted config backups (--pass-file, --dir, --keep)
   khaymali pool status|drain|undrain|failback   multi-Exit pool control on running Entry
   khaymali autopilot [--state FILE]     show Autopilot history
   khaymali pathtest serve|run ...       end-to-end multi-carrier path test & benchmark (pt1_...)
@@ -244,6 +246,22 @@ fn adapt_state_path(a: &Args, role: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `khaymali status | head`, `... | grep -q`: when the reader closes early, Rust's `println!`
+    // panics with "Broken pipe" and prints a backtrace. A closed pipe on the main thread is not an
+    // error worth a panic, so leave quietly (worker-thread panics keep the default handler).
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        if std::thread::current().name() == Some("main") && msg.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = argv.first().cloned() else {
         usage();
@@ -1092,6 +1110,92 @@ foreign_inner: {b_ip}/30");
                     }
                 }
                 _ => bail!("usage: khaymali ops doctor | tune [--apply] [--plan]"),
+            }
+        }
+        "tgbot" => {
+            #[cfg(unix)]
+            {
+                let token = a.get("token").or_else(|| std::env::var("KHAYMALI_TG_TOKEN").ok()).context("--token BOT_TOKEN (or KHAYMALI_TG_TOKEN) is required")?;
+                let admins: Vec<i64> = a
+                    .get("admin")
+                    .or_else(|| std::env::var("KHAYMALI_TG_ADMIN").ok())
+                    .context("--admin CHAT_ID[,CHAT_ID] is required (only these chats are answered)")?
+                    .split(',')
+                    .filter_map(|x| x.trim().parse().ok())
+                    .collect();
+                if admins.is_empty() {
+                    bail!("--admin must contain at least one numeric chat id");
+                }
+                let sock = a.get("control").unwrap_or_else(|| "/run/khaymali/entry.sock".into());
+                let ap_state = a.get("ap-state").unwrap_or_else(|| "/var/lib/khaymali/autopilot.state".into());
+                let bdir = a.get("dir").unwrap_or_else(|| "/var/backups/khaymali".into());
+                tgbot::run(token, admins, move |cmd| {
+                    let (sock, ap_state, bdir) = (sock.clone(), ap_state.clone(), bdir.clone());
+                    async move {
+                        use tgbot::Cmd;
+                        let rpc = |m: String| {
+                            let s = sock.clone();
+                            async move { send_control_rpc(&s, &m).await.unwrap_or_else(|e| format!("control socket error: {e}")) }
+                        };
+                        let q = |s: &str| s.replace(['"', '\\', '\n'], "");
+                        match cmd {
+                            Cmd::Help => tgbot::help_text(),
+                            Cmd::Status => rpc("{\"method\":\"status\"}".into()).await,
+                            Cmd::Pool => tgbot::format_pool(&rpc("{\"method\":\"pool.status\"}".into()).await),
+                            Cmd::Health => rpc("{\"method\":\"health.three_layer\"}".into()).await,
+                            Cmd::Autopilot => autopilot::status_text(&ap_state),
+                            Cmd::Backups => {
+                                let l = backup::list(&bdir);
+                                if l.is_empty() { "no backups".into() } else { l.iter().map(|(n, sz, _)| format!("{n}  {sz} bytes")).collect::<Vec<_>>().join("\n") }
+                            }
+                            Cmd::Drain(a) => rpc(format!("{{\"method\":\"pool.drain\",\"addr\":\"{}\"}}", q(&a))).await,
+                            Cmd::Undrain(a) => rpc(format!("{{\"method\":\"pool.undrain\",\"addr\":\"{}\"}}", q(&a))).await,
+                            Cmd::Failback => rpc("{\"method\":\"pool.failback\"}".into()).await,
+                            Cmd::Unknown(_) => format!("unknown command\n\n{}", tgbot::help_text()),
+                        }
+                    }
+                })
+                .await?;
+            }
+            #[cfg(not(unix))]
+            bail!("tgbot requires Unix domain sockets");
+        }
+        "backup" => {
+            let sub = argv.get(1).map(|s| s.as_str()).unwrap_or("list");
+            let dir = a.get("dir").unwrap_or_else(|| "/var/backups/khaymali".into());
+            let pass = || -> Result<String> {
+                if let Some(f) = a.get("pass-file") {
+                    return Ok(std::fs::read_to_string(&f).with_context(|| format!("reading {f}"))?.trim().to_string());
+                }
+                std::env::var("KHAYMALI_BACKUP_PASS").context("give --pass-file FILE or set KHAYMALI_BACKUP_PASS")
+            };
+            match sub {
+                "run" => {
+                    let sources: Vec<String> = match a.get("src") {
+                        Some(s) => s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+                        None => backup::DEFAULT_SOURCES.iter().map(|s| s.to_string()).collect(),
+                    };
+                    let p = backup::run(&dir, &pass()?, &sources, a.num("keep", backup::DEFAULT_KEEP).clamp(1, 1000), backup::PBKDF2_ROUNDS)?;
+                    println!("backup written: {p}");
+                }
+                "list" | "ls" => {
+                    for (n, size, ts) in backup::list(&dir) {
+                        println!("{n}  {size} bytes  (unix {ts})");
+                    }
+                }
+                "verify" => {
+                    let f = argv.get(2).context("usage: khaymali backup verify <FILE>")?;
+                    let blob = std::fs::read(f)?;
+                    let names = backup::verify_archive(&backup::open(&pass()?, &blob, backup::PBKDF2_ROUNDS)?)?;
+                    println!("OK: {} entries, all paths safe", names.len());
+                }
+                "restore" => {
+                    let f = argv.get(2).context("usage: khaymali backup restore <FILE> --to DIR")?;
+                    let to = a.get("to").context("--to DIR is required (restore never writes over / directly)")?;
+                    let names = backup::restore(f, &pass()?, &to, backup::PBKDF2_ROUNDS)?;
+                    println!("restored {} entries under {to}", names.len());
+                }
+                _ => bail!("usage: khaymali backup run|list|verify <FILE>|restore <FILE> --to DIR [--dir D] [--pass-file F]"),
             }
         }
         "harsh-nlp" => {

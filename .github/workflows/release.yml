@@ -31,7 +31,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list; sudo apt-get update
           sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
 
-      - name: Install Rust 1.75.0
+      - name: Install Rust 1.85.0 (matches rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@1.85.0
         with:
           targets: ${{ matrix.target }}
@@ -43,13 +43,25 @@ jobs:
           if [ ! -f Cargo.lock ]; then cargo generate-lockfile; fi
           cargo build --locked --release --target ${{ matrix.target }}
 
+      - name: Smoke-test the binary (native amd64 only)
+        if: matrix.name == 'linux-amd64'
+        run: |
+          B="target/${{ matrix.target }}/release/khaymali"
+          file "$B" | grep -qi "statically linked\|static-pie" || { echo "binary is not static"; file "$B"; exit 1; }
+          "$B" version
+          "$B" keygen | grep -q public
+          "$B" transports | grep -q wss
+
       - name: Package tarball & SHA-256
         run: |
           STAGE="khaymali-${{ matrix.name }}"
           mkdir -p "$STAGE/deploy" "$STAGE/scripts"
           cp "target/${{ matrix.target }}/release/khaymali" "$STAGE/"
           cp -r deploy/* "$STAGE/deploy/"
-          cp scripts/khaymali-tui "$STAGE/"
+          # helpers ship INSIDE the archive so install.sh never has to pull unverified code from main
+          cp scripts/khaymali-tui scripts/khaymali-manager "$STAGE/"
+          cp install.sh "$STAGE/scripts/"
+          cp scripts/server_verify.sh scripts/real_path_check.sh "$STAGE/scripts/"
           cp scripts/stress_live_300.sh scripts/check_baseline_regression.py scripts/ab_compare.py scripts/eval_nlp_replay.py scripts/make_annotation_set.py "$STAGE/scripts/"
           cp LICENSE README.md SECURITY.md CHANGELOG.md "$STAGE/"
           tar -czf "khaymali-${{ matrix.name }}.tar.gz" "$STAGE"

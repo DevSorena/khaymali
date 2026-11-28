@@ -18,6 +18,7 @@ command -v python3 >/dev/null || { echo "python3 required" >&2; exit 1; }
 command -v curl >/dev/null || { echo "curl required" >&2; exit 1; }
 ulimit -n 65535 2>/dev/null || true
 mkdir -p "$OUT_DIR"
+rm -f "$OUT_DIR"/exit.sock "$OUT_DIR"/entry.sock   # stale control sockets from an earlier run
 
 USE_NETEM=0
 if [[ "$(id -u)" -eq 0 ]] && command -v ip >/dev/null && command -v tc >/dev/null; then
@@ -26,9 +27,12 @@ else
   echo "[WARN] Not root or missing ip/tc: running loopback stress without tc netem injection." >&2
 fi
 
-NS_EXIT="kh-ns-exit-$$"
-VETH_EN="kh-ve-en-$$"
-VETH_EX="kh-ve-ex-$$"
+# Linux interface names are limited to 15 chars (IFNAMSIZ-1); a 7-digit PID would overflow
+# "kh-ve-en-<pid>", so use a short bounded suffix.
+SFX="$(( $$ % 100000 ))"
+NS_EXIT="kh-ns-exit-$SFX"
+VETH_EN="khen$SFX"
+VETH_EX="khex$SFX"
 EN_IP="10.233.77.1"
 EX_IP="10.233.77.2"
 HTTP_PID=""
@@ -36,7 +40,8 @@ EX_PID=""
 EN_PID=""
 
 cleanup() {
-  kill "$EN_PID" "$EX_PID" "$HTTP_PID" 2>/dev/null || true
+  for p in "$EN_PID" "$EX_PID" "$HTTP_PID"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null; done
+  wait 2>/dev/null || true
   if [[ "$USE_NETEM" -eq 1 ]]; then
     ip netns del "$NS_EXIT" 2>/dev/null || true
     ip link del "$VETH_EN" 2>/dev/null || true
@@ -106,7 +111,10 @@ run_mode() {
   local report_file="$OUT_DIR/report_${mode}_${profile}.json"
 
   apply_netem "$profile"
-  kill "$EN_PID" "$EX_PID" 2>/dev/null || true
+  for p in "$EN_PID" "$EX_PID"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null; done
+  wait "$EN_PID" "$EX_PID" 2>/dev/null || true
+  EN_PID=""; EX_PID=""
+  rm -f "$OUT_DIR"/exit.sock "$OUT_DIR"/entry.sock
   sleep 0.3
 
   if [[ "$USE_NETEM" -eq 1 ]]; then
@@ -126,7 +134,13 @@ run_mode() {
     --exit "wss://${EXIT_DIAL_IP}:29444" --camo-secret "$SEC" --camo-sni localhost \
     --socks "127.0.0.1:29080" --pool 8 --control "$OUT_DIR/entry.sock" >/dev/null 2>&1 &
   EN_PID=$!
-  sleep 0.8
+  # wait (max 20 s) until the SOCKS port really carries traffic, instead of a blind sleep
+  local up=0 i
+  for i in $(seq 1 40); do
+    if curl -s --max-time 3 --socks5-hostname 127.0.0.1:29080 -o /dev/null "http://127.0.0.1:18080/payload.bin"; then up=1; break; fi
+    sleep 0.5
+  done
+  [[ "$up" -eq 1 ]] || echo "[WARN] tunnel not carrying traffic after 20 s (profile=$profile mode=$mode); results will show it" >&2
 
   # Run Micro-NLP decision telemetry probe for this profile
   case "$profile" in

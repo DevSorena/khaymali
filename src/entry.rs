@@ -225,6 +225,13 @@ pub struct EntryCfg {
     pub dial_router: Option<Arc<crate::dial_route::DialRouter>>,
 }
 
+/// When every carrier already holds this many streams, the pool opens more carriers (up to
+/// `MAX_MUX_CARRIERS`). Under per-connection throttling (a common DPI response) each carrier is
+/// capped on its own, so more carriers means more total bandwidth; with 4 fixed carriers 200+
+/// simultaneous downloads queued behind a 256 KiB/s cap per carrier and timed out.
+const GROW_AT_STREAMS_PER_CARRIER: usize = 8;
+const MAX_MUX_CARRIERS: usize = 32;
+
 /// Pool of live multiplexed Noise carriers (each carrying up to 128 concurrent TCP streams
 /// with automatic rekey rotation and Turbo-Tunnel live `SessionOwner` reattachment).
 struct MuxPool {
@@ -253,7 +260,7 @@ impl MuxPool {
     fn insert(&self, c: Arc<MuxCarrier>) {
         let mut list = self.carriers.lock().unwrap();
         list.retain(|x| x.is_usable());
-        if list.len() < self.target_carriers {
+        if list.len() < MAX_MUX_CARRIERS.max(self.target_carriers) {
             list.push(c);
         }
     }
@@ -261,7 +268,10 @@ impl MuxPool {
     fn needs_more(&self) -> bool {
         let mut list = self.carriers.lock().unwrap();
         list.retain(|c| c.is_usable());
-        list.len() < self.target_carriers
+        if list.len() < self.target_carriers {
+            return true;
+        }
+        list.len() < MAX_MUX_CARRIERS && list.iter().map(|c| c.load()).min().unwrap_or(0) >= GROW_AT_STREAMS_PER_CARRIER
     }
 
     async fn ensure_carrier(
@@ -284,6 +294,30 @@ impl MuxPool {
             }
         }
         self.pick_least_loaded()
+    }
+
+    /// Keep the configured number of carriers alive even when idle, so the first burst of streams
+    /// is spread over all of them instead of piling onto the first carrier that comes up.
+    async fn warm(
+        self: &Arc<Self>,
+        pool: &LinkPool,
+        cfg: &EntryCfg,
+        direct: Option<&DirectDialer>,
+        adaptive: &AdaptiveRuntime,
+    ) {
+        {
+            let mut list = self.carriers.lock().unwrap();
+            list.retain(|x| x.is_usable());
+            if list.len() >= self.target_carriers {
+                return;
+            }
+        }
+        if let Ok(_gate) = self.open_gate.try_acquire() {
+            if let Acquired::Link(lk) = acquire(pool, cfg, direct, adaptive, &[3]).await {
+                let c = MuxCarrier::spawn(lk, cfg.max_age);
+                self.insert(c);
+            }
+        }
     }
 
     async fn open_resumable_tcp(
@@ -626,6 +660,23 @@ pub async fn run(cfg: EntryCfg) -> Result<()> {
     // Turbo-Tunnel Live Session Resume supervisor: watches for detached SessionOwners when
     // a MuxCarrier dies or rotates and seamlessly reattaches them to healthy carriers.
     if let Some(mp) = mux_pool.clone() {
+        let (mp_w, pool_w, cfg_w, dir_w, adp_w, ctl_w) = (
+            mp.clone(),
+            pool.clone(),
+            cfg.clone(),
+            direct_dialer.clone(),
+            adaptive.clone(),
+            ctl.clone(),
+        );
+        tokio::spawn(async move {
+            while !ctl_w.is_draining() {
+                tokio::select! {
+                    _ = sleep(Duration::from_millis(700)) => {}
+                    _ = ctl_w.drain_notify.notified() => break,
+                }
+                mp_w.warm(&pool_w, &cfg_w, dir_w.as_deref(), &adp_w).await;
+            }
+        });
         let (pool_re, cfg_re, dir_re, adp_re, ctl_re, sreg_re) = (
             pool.clone(),
             cfg.clone(),

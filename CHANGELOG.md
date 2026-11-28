@@ -1,3 +1,42 @@
+# Changelog
+
+All notable changes to Khaymali Tunnel are documented here. Historical version changelogs and audits (`v0.5.0` through `v0.14.0`) are preserved in [`docs/archive/`](docs/archive/).
+
+## [Unreleased on top of 0.22.1] - Release tooling and installer hardening (no Rust changes)
+
+### Added
+- `scripts/server_verify.sh`: one command that runs everything a sandbox could not (build with the pinned toolchain, all e2e, netns/tc, GRE, FOU, nft, WireGuard, raw-socket spoof, systemd unit verification, real Telegram Bot API check, chaos, netem, clean+netem stress, harsh shadow vs active, A/B gate, NLP replay, netns A/B). PASS/FAIL/SKIP per step with the reason; a failure never stops the run.
+- `scripts/real_path_check.sh`: real Iran <-> abroad path check (origin on the Exit's loopback, load through the tunnel, ping RTT/loss, JSON result).
+- `tests/scripts_selftest.sh` + `tests/tools/mini_socks5.py`: tests the stress tooling itself (load generator, impairment proxy, A/B and baseline gates) with no binary and no root; added to CI.
+- `docs/PROJECT_MEMORY.md`: current project state, verified/unverified matrix, decisions, open items.
+- Release workflow: archive now includes `khaymali-manager`, `install.sh`, `server_verify.sh`, `real_path_check.sh`; amd64 binary is smoke-tested (static, `version`, `keygen`, `transports`).
+
+### Fixed
+- systemd units (entry/exit/bridge): added sandboxing (kernel modules/logs/cgroups/clock, namespaces, realtime, SUID, W^X memory, native syscalls, UMask 0077, stop timeout). `PrivateDevices` and capability limits are deliberately NOT set: TUN/raw/GRE modes need them. Verified with `systemd-analyze verify` only; confirm the services start on your server.
+- `install.sh` fetched `khaymali-manager`/`khaymali-tui` from the `main` branch and installed them as root on top of a pinned, checksum-verified install. Helpers now come from the verified archive; if missing they are fetched from the same ref as the binary (`KHAYMALI_HELPERS_REF` overrides) and syntax-checked.
+- `install.sh` silently ignored unknown or mistyped options (a typo of `--revert-tune` would install instead); options that need a value now fail clearly, unknown options are rejected, `--help` added.
+- `stress_harsh_300_ab.sh`: veth names (`kh-ve-en-<pid>`) exceeded the 15-character interface limit for 7-digit PIDs; names are now short and bounded. Waits until the tunnel really carries traffic instead of fixed sleeps, removes stale control sockets, kills/waits for children on cleanup.
+- `tests/stress.sh` ran the whole load twice per profile (text table, then JSON); now one run, rendered from the JSON.
+- `tests/netem.sh` depended on the current directory and ignored a failing `tc`; paths are now script-relative and a `tc` failure is reported.
+- `docs/RELEASE_GUIDE.md` was stale (Rust 1.75, rc tag, placeholder owner); README toolchain badge/text now say 1.85.0.
+
+## [0.22.1] - Verified build: stream EOF, frozen-carrier detection, balanced carriers, backups, Telegram bot
+
+### Fixed (found by running the stress suite, not by reading code)
+- **Stream EOF never crossed the tunnel** with the default `mux + session-resume`: the `SeqFin` frame was only ever received, never sent, so a `Connection: close` response (or a client half-close) hung until a timeout. EOF now travels in-band as an empty chunk in the same sequence as the data (cannot overtake it, replayed after a carrier switch); once one direction has finished the other gets `HALF_CLOSE_GRACE` (60 s). Regression test: `tests/eof_e2e.sh`.
+- **Carrier load was always 0 for resumable streams** (the default). Every new stream picked the same "least loaded" carrier, so one TCP connection carried everything (one throttled connection = the whole tunnel). `MuxCarrier::load()` now counts live resumable sessions.
+- **A silently frozen carrier stayed "alive" forever.** A stall monitor pings a quiet carrier that has work in flight (4 s) and replaces it after 15 s of total silence (75 s when idle); resumable sessions move to another carrier.
+- Two unit tests used tokens containing `_`, which the `_`-separated setup bundles cannot carry (real tokens are alphanumeric).
+
+### Added
+- Carrier growth under load: when every carrier holds 8+ streams, the pool opens more (up to 32); carriers are kept warm at the configured count even when idle.
+- `src/backup.rs`: `khaymali backup run|list|verify|restore` — AES-256-GCM, PBKDF2-HMAC-SHA256 (200k rounds), path-checked restore, rotation.
+- `src/tgbot.rs`: `khaymali tgbot --token T --admin CHAT_ID` — admin-only Telegram control (`/status /pool /health /autopilot /backups /drain /undrain /failback`).
+
+### Test tooling
+- `tests/harsh_proxy.py`: delay is now pipelined like netem (latency moves arrival time, it no longer caps throughput) with bounded in-flight data under `--rate`; old behaviour with `--serial-delay`. The old model capped every connection at ~50 KB/s under 300 ms delay and made multiplexed carriers look broken.
+- `tests/stress_harsh.sh`: waits for the proxy and exit before starting the entry; `START_WAIT`, `UP_TRIES`, `ENTRY_EXTRA`.
+
 ## [0.22.0] - Pure Tunneling Edition (Web Panel Stripped & Live Micro-NLP Integration)
 
 - **Pure Tunneling Only**: Removed the bundled `panel/` directory (~37 MB Go web panel binaries & source), `src/customers.rs` (reseller billing/quota module), and all panel-only HTTP/UI hooks from `ops_suite.rs`, `node_cluster.rs`, `main.rs`, and `scripts/khaymali-manager`.
@@ -32,10 +71,6 @@
 ### Phase 2: FRP & Backhaul Engine Managers, Setup Bundles & Auto Pool
 - **Setup Bundles (`src/setup_bundle.rs`)**: Full `hsh1_`, `bh1_`, and `gh1_` encode/parse/apply (`+udp<port>` companion, `fou<p1>-<p2>`, `tr-<transport>`), port range & mapping parser (`443, 8080-8090, 2083=8443`), `rewrite_frpc_toml_ports` carrying over per-proxy options, and UFW `ufw.opened` tracking.
 - **Engine Managers & Setup (`src/engines.rs`)**: FRP (`frps`/`frpc` TOML for `tcp`/`kcp`/`quic`/`websocket` + PROXY protocol v1/v2, bandwidth cap, TCP health checks), Backhaul (`backhaul-server`/`backhaul-client` TOML for all 7 transports, flat+sectioned TOML parser, live `connection_pool` 1..64 tuning, `backhaul-udp-*` companion), transactional Iran/Foreign setup planner, and `auto_pool_for_clash` / `undo_auto_pools`.
-
-# Changelog
-
-All notable changes to Khaymali Tunnel are documented here. Historical version changelogs and audits (`v0.5.0` through `v0.14.0`) are preserved in [`docs/archive/`](docs/archive/).
 
 ## [0.18.0] - Complete Khaymali Tunneling Suite Port
 

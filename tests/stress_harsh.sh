@@ -131,11 +131,17 @@ for name in $ORDER; do
   : > "$T/entry.log"
   python3 "$HERE/harsh_proxy.py" 127.0.0.1:4441 127.0.0.1:4440 $opts 2>"$T/proxy-$name.log" & PX=$!
   KHAYMALI_KEY=$EXSK "$B" exit --listen 127.0.0.1:4440 --allow "$ENPK" --allow-private >/dev/null 2>"$T/exit.log" & EXP=$!
-  KHAYMALI_KEY=$ENSK "$B" entry --socks 127.0.0.1:1080 --exit-pub "$EXPK" --exit 127.0.0.1:4441 --pool "$POOL" --metrics 127.0.0.1:9109 >/dev/null 2>"$T/entry.log" & ENP=$!
-  sleep 2
+  # wait until the hostile proxy and the exit really listen, so the entry's first dials do not
+  # open its circuit breaker (matters on slow or single-core machines)
+  for _ in $(seq 1 100); do
+    (exec 3<>/dev/tcp/127.0.0.1/4440) 2>/dev/null && (exec 3<>/dev/tcp/127.0.0.1/4441) 2>/dev/null && break
+    sleep 0.2
+  done
+  KHAYMALI_KEY=$ENSK "$B" entry --socks 127.0.0.1:1080 --exit-pub "$EXPK" --exit 127.0.0.1:4441 --pool "$POOL" ${ENTRY_EXTRA:-} --metrics 127.0.0.1:9109 >/dev/null 2>"$T/entry.log" & ENP=$!
+  sleep "${START_WAIT:-2}"
   echo "=== profile: $name [$opts] (min ok ${min}%) ==="
   up=no
-  for _ in 1 2 3 4 5 6; do
+  for _ in $(seq 1 "${UP_TRIES:-6}"); do
     if python3 "$T/socks_stress.py" 127.0.0.1:1080 /index.html 1 10 | grep -q '"ok": 1'; then up=yes; break; fi
     sleep 1
   done

@@ -56,10 +56,20 @@ run_profile() {
   # warm-up: make sure the tunnel really carries traffic before measuring
   curl -s --max-time 20 --socks5-hostname 127.0.0.1:1080 http://127.0.0.1:8000/index.html | grep -q STRESS-OK \
     || { echo "  tunnel did not come up (see $T/entry.log)"; tail -5 "$T/entry.log"; FAIL=1; tunnel_down; return; }
-  bash "$HERE/../scripts/stress_live_300.sh" 127.0.0.1:1080 http://127.0.0.1:8000/small.bin "$MAX_STEP"
+  # ONE load run per profile (it used to run twice: once for the text table, once for JSON,
+  # which doubled the load and the run time). The JSON is rendered as the table below.
+  bash "$HERE/../scripts/stress_live_300.sh" 127.0.0.1:1080 http://127.0.0.1:8000/small.bin "$MAX_STEP" --json >"$OUT/$name.json" 2>"$OUT/$name.err"
   local rc=$?
-  bash "$HERE/../scripts/stress_live_300.sh" 127.0.0.1:1080 http://127.0.0.1:8000/small.bin "$MAX_STEP" --json >"$OUT/$name.json" 2>/dev/null || true
-  [ $rc -eq 0 ] && echo "  RESULT $name: PASS" || { echo "  RESULT $name: FAIL (<95% ok on some step)"; FAIL=1; }
+  python3 - "$OUT/$name.json" <<'PYT'
+import json, sys
+try:
+    r = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f"  (no JSON result: {e})"); sys.exit(0)
+for s in r.get("steps", []):
+    print(f" [STEP {s['concurrency']:>3}] ok={s['ok']:>3}/{s['total']:<3} | p50={s['p50_ms']:>6.1f}ms p95={s['p95_ms']:>6.1f}ms p99={s['p99_ms']:>6.1f}ms | goodput={s['goodput_kbps']:>8.1f}kbps | RSS={s['rss_mb']}MB")
+PYT
+  [ $rc -eq 0 ] && echo "  RESULT $name: PASS" || { echo "  RESULT $name: FAIL (<95% ok on some step, or the load generator failed: $OUT/$name.err)"; FAIL=1; }
   tunnel_down
 }
 

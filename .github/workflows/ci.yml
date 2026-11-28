@@ -74,5 +74,7 @@ jobs:
           python3 -m py_compile scripts/khaymali-tui
       - name: Python syntax check
         run: python3 -m py_compile scripts/*.py tests/*.py
+      - name: Test tooling (stress generator, impairment proxy, A/B gates) - no binary needed
+        run: bash tests/scripts_selftest.sh
       - name: Validate Grafana JSON
         run: python3 -c "import json; json.load(open('deploy/grafana/khaymali-dashboard.json'))"

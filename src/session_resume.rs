@@ -565,6 +565,13 @@ impl SessionOwner {
         }
     }
 
+    /// End-of-stream marker: an empty chunk staged like any other, so it keeps its place in the
+    /// sequence (never overtakes data) and is replayed after a carrier switch. The receiving side
+    /// treats an empty chunk as EOF and half-closes its socket.
+    pub async fn send_fin(&self, budget: Duration) -> Result<()> {
+        self.send_from_socket(Vec::new(), budget).await
+    }
+
     /// Apply a cumulative ACK from the peer and wake senders waiting for window space.
     pub fn apply_ack(&self, ack: u64) {
         self.dataplane.lock().unwrap().process_ack(ack);

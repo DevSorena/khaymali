@@ -1,24 +1,76 @@
-Khaymali Tunnel v0.22.0 — Pure Tunneling Edition (Panel Removed, Live Micro-NLP Wired)
-======================================================================================
-Included Pure-Tunneling Modules (Zero Extra Crates in Cargo.toml):
-  Core Tunnel:   entry.rs, exit.rs, bridge.rs, link.rs, mux.rs, forward.rs, udp.rs,
-                 camo.rs, fallback.rs, shaper.rs, session_resume.rs, l3.rs, pool.rs
-  Carriers:      transport.rs, udp_transport.rs, ktunnel.rs, ws_transport.rs,
-                 ssh_carrier.rs, spoof_carrier.rs, l3_wraps.rs
-  Engines/Swap:  engines.rs (FRP & Backhaul), setup_bundle.rs (hsh1_/bh1_/gh1_),
-                 xray_engine.rs, sshfwd.rs, carrier_swap.rs
-  Cluster/Mesh:  cluster_mesh.rs, cluster_lb.rs, node_cluster.rs, fleet.rs, dial_route.rs
-  Resilience:    recovery.rs, harsh_nlp.rs (live-wired + RPC), kani_nlp.rs, intelligence.rs,
-                 autopilot.rs, watchdog.rs, pathtest.rs, revpath.rs, rescue.rs, ops_suite.rs
-  Foundation:    hjson.rs, sysrun.rs, control.rs, stats.rs, util.rs, alerts.rs
+Khaymali Tunnel v0.22.1 + release tooling - status after the hardening round (2026-11-28)
+=====================================================================================
+READ THIS FIRST: in this round there was NO Rust toolchain/crate access (network closed), so the Rust
+sources are byte-for-byte the 0.22.1 sources and were NOT recompiled. Nothing in src/ was changed on
+purpose: an uncompiled edit to a 33k-line crate is a risk, not an improvement. harsh_nlp.rs and the NLP
+code are untouched. All changes are in scripts, tests, CI, installer and docs.
 
-Removed (Web Panel & Reseller Billing):
-  - panel/ directory (Go web panel binaries, Go source zip, panel scripts)
-  - src/customers.rs (customer reseller/billing module)
-  - Panel HTTP relay & Sentinel web hooks
+Verified in this round (actually executed):
+  bash -n on every shell script; py_compile on every Python script (+ khaymali-tui AST parse)
+  tests/scripts_selftest.sh        11/11  load generator vs local SOCKS5, harsh_proxy (forward / delay /
+                                          early-RST), ab_compare + baseline gates (pass and fail cases)
+  tests/manager.sh                 43/43
+  scripts/real_path_check.sh       ran against a local SOCKS5: origin, warm-up, stepped load, JSON
+  scripts/server_verify.sh         harness logic run with a stub binary (preflight, PASS/FAIL/SKIP, port
+                                   check, summary); raw-socket spoof primitive OK, nft table add/delete OK,
+                                   systemd-analyze verify on the 3 units OK (sandbox has no ip/tc/wg)
+  install.sh                       option parsing (unknown option, missing value, --help)
 
-Verification on your Linux Server:
-  1. cargo test --lib
-  2. cargo build --release
-  3. bash scripts/verify_build_and_tests.sh
-  4. sudo bash scripts/stress_harsh_300_ab.sh target/release/khaymali /tmp/khaymali-ab
+Changed (see CHANGELOG "Unreleased on top of 0.22.1"):
+  install.sh no longer pulls helper scripts from the main branch over a verified/pinned install; rejects
+  unknown options. stress_harsh_300_ab.sh veth-name length bug (7-digit PIDs) + readiness wait.
+  stress.sh ran the load twice. netem.sh path/tc handling. Release archive now ships the manager,
+  install.sh and the verification scripts and smoke-tests the amd64 binary. CI runs the tooling selftest.
+  New: scripts/server_verify.sh, scripts/real_path_check.sh, docs/PROJECT_MEMORY.md.
+
+STILL NOT VERIFIED (needs your server) - run ONE command and read its report:
+  sudo bash scripts/server_verify.sh                         # --quick for a ~10 min smoke run
+  sudo TG_TOKEN=... TG_CHAT=... bash scripts/server_verify.sh   # also real Telegram delivery
+  bash scripts/real_path_check.sh origin | run EXIT_IP       # real Iran <-> abroad path (2 servers)
+  It covers: build with the pinned Rust 1.85.0, cargo test, all e2e, netns/tc, GRE, FOU, nft, WireGuard,
+  raw-socket spoof, systemd units, chaos.sh, netem.sh, stress.sh (+netem), stress_harsh shadow vs active,
+  A/B gate, NLP replay, stress_harsh_300_ab.sh. Multi-core: it prints nproc; on a 1-core host the
+  multi-core claim stays unverified.
+  Also still open: a REAL PMTU blackhole (pmtu_drop_4k fails in both modes with the synthetic proxy),
+  and a measurable benefit of active NLP (shadow vs active showed noise-level differences).
+
+------------------------------------------------------------------------------------------------
+Previous status (v0.22.1 build, kept for reference)
+------------------------------------------------------------------------------------------------
+Khaymali Tunnel v0.22.1 - verified build
+=======================================
+What was actually run (Linux sandbox, 1 CPU core, Rust 1.75 with older pinned crates; the project
+toolchain is 1.85, so run the commands below once on your own server before publishing):
+
+  cargo test --release              163 unit tests + 22 security tests: all pass
+  tests/eof_e2e.sh                  4/4   stream EOF in both directions, default settings
+  tests/pool_e2e.sh                 5/5   multi-Exit pool: balance, drain, standby failover
+  tests/autopilot_e2e.sh            5/5   down/recovered detection, history, webhook alerts
+  tests/integration.sh              14/14 (includes multi-exit failover)
+  tests/khaymali_suite_e2e.sh       pass  carriers, GRE allocator, Spoof+WG, Mesh NAT, live WS+WSS
+  tests/manager.sh                  43/43 (6 consecutive runs; a SIGPIPE race in restore was fixed)
+  tests/intelligence_cli.sh         pass
+  CLI smoke test                    50 subcommand invocations: no panic, no hang
+
+Stress (tests/stress_harsh.sh, 200/250/300 SOCKS clients, 10 hostile profiles, 2 repeats = 15,000
+requests per mode):
+  shadow  53/60 runs pass, 13,347/15,000 requests ok (89.0%)
+  active  54/60 runs pass, 13,463/15,000 requests ok (89.8%)
+  Pass in both modes: clean, latency 300ms+-100, loss 10%, loss 25%, early RST 30%, freeze,
+  blackhole bursts, hostile mix, per-connection throttle 256 KiB/s (first cold step can be slower).
+  Fails in both modes: pmtu_drop_4k (0-1%). The proxy deletes bytes from inside the TCP stream,
+  which real TCP never does, and it permanently breaks the encrypted stream. Whether a REAL PMTU
+  blackhole is handled has not been verified.
+  shadow vs active differ only within noise: this run does not show a benefit from active NLP.
+
+Not verified here (needs a real server): root-only features (netns/tc, GRE/FOU, nft, systemd,
+WireGuard, raw-socket spoof), real Telegram delivery (bot and alerts), real Iran<->abroad paths,
+tests/chaos.sh, tests/netem.sh, scripts/stress_harsh_300_ab.sh, tests/stress.sh.
+
+Run on your server:
+  cargo test --release && cargo build --release --locked
+  bash tests/integration.sh target/release/khaymali
+  bash tests/stress_harsh.sh target/release/khaymali          # KHAYMALI_NLP_MODE=shadow|active
+  sudo bash scripts/stress_harsh_300_ab.sh target/release/khaymali /tmp/khaymali-ab
+
+Removed in this edition: web panel (panel/), src/customers.rs.

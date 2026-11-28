@@ -390,7 +390,11 @@ backup_conf(){ mkdir -p "$BK"; local f="$BK/khaymali-conf-$(date +%Y%m%d-%H%M%S)
   tar -czf "$f" -C "$(dirname "$ETC")" "$(basename "$ETC")" 2>/dev/null && chmod 600 "$f" && { [ "${1:-}" = quiet ] || ok "backup: $f (contains private keys!)"; }; }
 backup(){ backup_conf "$@"; }
 restore(){ local f=${1:-}; [ -z "$f" ] && { ls -1 "$BK" 2>/dev/null; f=$(ask "File" "$(ls -1t "$BK"/*.tar.gz 2>/dev/null | head -1)"); }
-  tar -tzf "$f" | grep -qvE "^$(basename "$ETC")(/|$)" && { err "archive contains foreign paths, refusing"; return 1; }
+  # list first, then grep the variable: `tar | grep -q` can die of SIGPIPE under pipefail and let a
+  # foreign archive through
+  local lst; lst=$(tar -tzf "$f" 2>/dev/null) || { err "cannot read archive $f"; return 1; }
+  grep -qvE "^$(basename "$ETC")(/|$)" <<<"$lst" && { err "archive contains foreign paths, refusing"; return 1; }
+  grep -qE '(^|/)\.\.(/|$)|^/' <<<"$lst" && { err "archive contains absolute or .. paths, refusing"; return 1; }
   tar -xzf "$f" -C "$(dirname "$ETC")" && for r in $(roles); do apply_role "$r"; done; }
 cleanup(){ journalctl --vacuum-size=100M >/dev/null 2>&1; ls -1t "$BK"/*.tar.gz 2>/dev/null | tail -n +6 | xargs -r rm -f; ok "logs vacuumed to 100M, old backups pruned"; df -h / | tail -1; }
 update(){
