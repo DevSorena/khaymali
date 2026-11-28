@@ -661,9 +661,10 @@ async fn neg_19_end_to_end_mux_carrier_session_resume_across_carrier_kill() {
     // Carrier 1 (will be killed mid-session)
     let (a1, b1) = duplex(1 << 16);
     let (xsk1, al1, er1) = (xsk.clone(), allowed.clone(), exit_reg.clone());
+    let xpk1 = xpk.clone();
     let exit_c1 = tokio::spawn(async move {
         let lk = link::respond(Box::new(b1), &xsk1, &al1).await.unwrap();
-        let _ = serve_exit_with_registry(lk, true, er1, xpk.clone()).await;
+        let _ = serve_exit_with_registry(lk, true, er1, xpk1).await;
     });
     let entry_lk1 = link::initiate(Box::new(a1), &esk, &xpk).await.unwrap();
     let carrier1 = MuxCarrier::spawn(entry_lk1, Duration::from_secs(60));
@@ -690,9 +691,10 @@ async fn neg_19_end_to_end_mux_carrier_session_resume_across_carrier_kill() {
     // Spin up Carrier 2 and reattach the detached SessionOwner with epoch = 2
     let (a2, b2) = duplex(1 << 16);
     let (xsk2, al2, er2) = (xsk, allowed, exit_reg);
+    let xpk2 = xpk.clone();
     let exit_c2 = tokio::spawn(async move {
         let lk = link::respond(Box::new(b2), &xsk2, &al2).await.unwrap();
-        let _ = serve_exit_with_registry(lk, true, er2, xpk.clone()).await;
+        let _ = serve_exit_with_registry(lk, true, er2, xpk2).await;
     });
     let entry_lk2 = link::initiate(Box::new(a2), &esk, &xpk).await.unwrap();
     let carrier2 = MuxCarrier::spawn(entry_lk2, Duration::from_secs(60));
