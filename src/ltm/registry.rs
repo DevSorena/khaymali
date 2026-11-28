@@ -13,7 +13,6 @@ pub const PROTOCOLS: &[Protocol] = &[
     Protocol { id: "ipip", name: "IPIP", layer: "L3", port: None },
     Protocol { id: "gre", name: "GRE", layer: "L3", port: None },
     Protocol { id: "gretap", name: "GRETAP", layer: "L2", port: None },
-    Protocol { id: "eoip", name: "EoIP", layer: "L2", port: None },
     Protocol { id: "vxlan", name: "VXLAN", layer: "L2", port: Some(4789) },
     Protocol { id: "geneve", name: "GENEVE", layer: "L2", port: Some(6081) },
     Protocol { id: "sit", name: "SIT-6in4", layer: "L3", port: None },
@@ -22,5 +21,5 @@ pub const PROTOCOLS: &[Protocol] = &[
 ];
 
 pub fn by_id(id: &str) -> Option<&'static Protocol> {
-    PROTOCOLS.iter().find(|p| p.id == id)
+    PROTOCOLS.iter().find(|p| p.id.eq_ignore_ascii_case(id))
 }

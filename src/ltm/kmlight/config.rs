@@ -1,5 +1,4 @@
-use crate::json_min;
-use crate::system::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -19,12 +18,30 @@ pub struct KmLightConfig {
     pub keepalive: u64,
 }
 
+fn get_str(obj: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let i = obj.find(&pat)?;
+    let rest = obj[i + pat.len()..].trim_start();
+    if !rest.starts_with(':') {
+        return None;
+    }
+    let rest = rest[1..].trim_start();
+    if rest.starts_with('"') {
+        let rest = &rest[1..];
+        let end = rest.find('"')?;
+        Some(rest[..end].to_string())
+    } else {
+        let end = rest
+            .find(|c: char| c == ',' || c == '}' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        Some(rest[..end].trim().to_string())
+    }
+}
+
 impl KmLightConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let data = fs::read_to_string(path)?;
-        let g = |k: &str, def: &str| {
-            json_min::get_str(&data, k).unwrap_or(def).to_string()
-        };
+        let data = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let g = |k: &str, def: &str| get_str(&data, k).unwrap_or_else(|| def.to_string());
         Ok(KmLightConfig {
             role: g("role", "server"),
             listen: g("listen", ""),
@@ -37,9 +54,9 @@ impl KmLightConfig {
             },
             tun_ip: g("tun_ip", "10.200.0.1"),
             peer_ip: g("peer_ip", "10.200.0.2"),
-            prefix: json_min::get_u64(&data, "prefix").unwrap_or(30) as u8,
-            mtu: json_min::get_u64(&data, "mtu").unwrap_or(1400) as u32,
-            keepalive: json_min::get_u64(&data, "keepalive").unwrap_or(3),
+            prefix: get_str(&data, "prefix").and_then(|s| s.parse().ok()).unwrap_or(30),
+            mtu: get_str(&data, "mtu").and_then(|s| s.parse().ok()).unwrap_or(1400),
+            keepalive: get_str(&data, "keepalive").and_then(|s| s.parse().ok()).unwrap_or(3),
         })
     }
 
@@ -47,7 +64,7 @@ impl KmLightConfig {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut map = HashMap::new();
+        let mut map: HashMap<&str, String> = HashMap::new();
         map.insert("role", self.role.clone());
         map.insert("listen", self.listen.clone());
         map.insert("remote", self.remote.clone());
@@ -59,7 +76,15 @@ impl KmLightConfig {
         map.insert("prefix", self.prefix.to_string());
         map.insert("mtu", self.mtu.to_string());
         map.insert("keepalive", self.keepalive.to_string());
-        fs::write(path, json_min::obj_from_map(&map))?;
+        let mut parts = Vec::new();
+        for (k, v) in &map {
+            if v.parse::<i64>().is_ok() {
+                parts.push(format!("  \"{k}\": {v}"));
+            } else {
+                parts.push(format!("  \"{k}\": \"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")));
+            }
+        }
+        fs::write(path, format!("{{\n{}\n}}\n", parts.join(",\n")))?;
         Ok(())
     }
 }

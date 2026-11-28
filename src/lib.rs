@@ -32,6 +32,7 @@ pub mod intelligence;
 pub mod kani_nlp;
 pub mod ktunnel;
 pub mod l3;
+pub mod ltm;
 pub mod l3_wraps;
 pub mod link;
 pub mod mux;

@@ -1,6 +1,6 @@
 use khaymali::{
     alerts, autopilot, backup, bridge, camo, carrier_swap, cluster_lb, cluster_mesh, dial_route,
-    engines, entry, exit, fleet, forward, harsh_nlp, kani_nlp, l3, l3_wraps, link, node_cluster,
+    engines, entry, exit, fleet, forward, harsh_nlp, kani_nlp, l3, l3_wraps, link, ltm, node_cluster,
     ops_suite, pathtest, pool, rescue, revpath, setup_bundle, spoof_carrier, sshfwd, stats, sysrun,
     tgbot, transport, transport_engine, util, xray_engine,
 };
@@ -158,6 +158,11 @@ fn usage() {
   khaymali ui | menu                    live dashboard (TUI) | setup & management menu
   khaymali keygen                       new static keypair + 12-char check code + SHA-256 fingerprint
   khaymali secret                       new random camouflage secret
+  khaymali tunnels | ltm                classic tunnels + Khaymali Light (interactive)
+  khaymali tunnels-restore              restore persisted classic tunnels (boot)
+  khaymali tunnels-clean                remove temporary tunnel interfaces
+  khaymali tunnels-qos --dev IFACE         apply QoS (cake/fq_codel/htb) on tunnel iface
+  khaymali light [--config PATH]        run Khaymali Light data plane
   khaymali check-code <HEX_PUBKEY>      print UI tag, 12-char check code & full SHA-256 fingerprint
   khaymali join-code --endpoint HOST:PORT --exit-pub PUB [--transport auto|udp|ktunnel|camo|tcp]
                      [--camo-sni NAME] [--camo-secret HEX] [--forward 443,2052]
@@ -295,6 +300,81 @@ sha256:     {}",
             );
         }
         "secret" => println!("{}", hex(&util::rand_bytes::<32>())),
+        "tunnels" | "ltm" => {
+            ltm::run_menu()?;
+        }
+        "tunnels-restore" | "ltm-restore" => {
+            if unsafe { libc::geteuid() } != 0 {
+                bail!("Root privileges required for tunnels-restore");
+            }
+            ltm::config::ensure_state_dir().ok();
+            ltm::restore_all()?;
+        }
+        "tunnels-clean" | "ltm-clean" => {
+            if unsafe { libc::geteuid() } != 0 {
+                bail!("Root privileges required for tunnels-clean");
+            }
+            ltm::auto_cleanup(true);
+        }
+        "light" => {
+            let cfg_path = a.get("config").unwrap_or_else(|| ltm::config::KMLIGHT_CONFIG.to_string());
+            let cfg = ltm::kmlight::KmLightConfig::load(std::path::Path::new(&cfg_path))?;
+            ltm::kmlight::Link::run(cfg)?;
+        }
+        "tunnels-qos" | "ltm-qos" => {
+            let dev = a.get("dev").unwrap_or_else(|| "kmlight0".into());
+            if a.flag("status") {
+                ltm::qos::status(&dev);
+            } else if a.flag("clear") {
+                ltm::qos::clear(&dev)?;
+            } else {
+                let profile = a.get("profile").unwrap_or_else(|| "cake".into());
+                let rate = a.get("rate");
+                let p = match profile.as_str() {
+                    "host" => ltm::qos::QosProfile::Host,
+                    "low-latency" | "fq_codel" | "fq-codel" => ltm::qos::QosProfile::LowLatency,
+                    "cake" => ltm::qos::QosProfile::Cake,
+                    "cake-limit" | "cake_limited" => ltm::qos::QosProfile::CakeLimited,
+                    "htb" | "rate" | "limit" => ltm::qos::QosProfile::RateLimit,
+                    other => bail!("unknown --profile {other} (host|low-latency|cake|cake-limit|htb)"),
+                };
+                ltm::qos::apply_profile(&dev, p, rate.as_deref())?;
+            }
+        }
+        "tunnels-bench" | "ltm-bench" => {
+            let server = a.flag("server");
+            let port: u16 = a
+                .get("port")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(ltm::benchmark::STREAM_PORT);
+            let duration: u64 = a
+                .get("duration")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(ltm::benchmark::DEFAULT_DURATION);
+            if server {
+                if unsafe { libc::geteuid() } != 0 {
+                    // binding low ports may need root; 5201 does not — allow non-root
+                }
+                ltm::benchmark::run_server_bench(port, duration)?;
+            } else {
+                let target = a
+                    .get("target")
+                    .or_else(|| a.get("peer"))
+                    .context("usage: khaymali tunnels-bench --target <IP> [--bind IP] [--duration N] [--port N]")?;
+                let bind = a.get("bind");
+                let proto = a.get("proto").unwrap_or_else(|| "manual".into());
+                let r = ltm::benchmark::run_client_bench(
+                    &proto,
+                    &target,
+                    bind.as_deref(),
+                    duration,
+                    port,
+                );
+                let mut list = vec![r];
+                ltm::benchmark::rank(&mut list);
+                ltm::benchmark::print_table(&list);
+            }
+        }
         "check-code" => {
             let h = argv.get(1).context("usage: khaymali check-code <HEX_PUBKEY>")?;
             let raw = unhex(h)?;
